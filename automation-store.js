@@ -1,0 +1,52 @@
+import fs from 'fs'
+import path from 'path'
+import crypto from 'crypto'
+
+const root = path.resolve('accounts')
+const defaults = () => ({
+  timezone: 'Africa/Lagos', delaySeconds: [5, 15], statusRecipients: [], recipients: [],
+  groupLists: {}, messages: [], jobs: []
+})
+
+function fileFor(accountId) {
+  const id = String(accountId)
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(id)) throw new Error('Invalid account ID.')
+  const accountDir = path.resolve(root, id)
+  if (!accountDir.startsWith(root + path.sep)) throw new Error('Invalid account storage path.')
+  if (fs.existsSync(root) && fs.lstatSync(root).isSymbolicLink()) throw new Error('Account storage root cannot be a symbolic link.')
+  if (fs.existsSync(accountDir) && fs.lstatSync(accountDir).isSymbolicLink()) throw new Error('Account storage directory cannot be a symbolic link.')
+  const file = path.join(accountDir, 'automation.json')
+  if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) throw new Error('Account automation data cannot be a symbolic link.')
+  return file
+}
+
+export function loadAutomation(accountId, legacy = {}) {
+  const file = fileFor(accountId)
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  if (fs.existsSync(file)) {
+    try { return { ...defaults(), ...JSON.parse(fs.readFileSync(file, 'utf8')) } }
+    catch { throw new Error('Account automation data is corrupt. Repair its local automation.json file.') }
+  }
+  const data = { ...defaults(), ...legacy }
+  const migratedJobs = []
+  const messages = []
+  for (const [i, old] of (legacy.jobs || []).entries()) {
+    const messageId = crypto.randomUUID()
+    messages.push({ id: messageId, name: old.name || `Message ${i + 1}`, texts: Array.isArray(old.texts) ? old.texts : [old.text || ''], media: old.media || old.image || '', createdAt: new Date().toISOString() })
+    migratedJobs.push({ ...old, id: crypto.randomUUID(), messageId, repeatCount: 1, delaySeconds: legacy.delaySeconds || [5, 15], status: old.enabled === false ? 'paused' : 'scheduled', progress: 0, completed: 0, createdAt: new Date().toISOString(), scheduledAt: old.cron || '' })
+  }
+  if (migratedJobs.length) { data.messages = messages; data.jobs = migratedJobs }
+  saveAutomation(accountId, data)
+  return data
+}
+
+export function saveAutomation(accountId, data) {
+  const file = fileFor(accountId)
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  const tmp = `${file}.${crypto.randomUUID()}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' })
+  if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) { fs.rmSync(tmp, { force: true }); throw new Error('Account automation data cannot be a symbolic link.') }
+  fs.renameSync(tmp, file)
+}
+
+export function makeId() { return crypto.randomUUID() }

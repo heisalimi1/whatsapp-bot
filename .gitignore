@@ -1,0 +1,17 @@
+node_modules/
+accounts/
+accounts.json
+auth/
+log.txt
+groups.txt
+.env
+.env.*
+!.env.example
+*.pem
+*.session
+*.key
+accounts/*/auth/
+messages.local.json
+auth.sqlite
+auth.sqlite-shm
+auth.sqlite-wal
