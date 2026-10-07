@@ -1,0 +1,10 @@
+{
+  "phone": "234XXXXXXXXXX",
+  "dashboardPassword": "put-a-long-unique-password-here",
+  "dashboardPort": 3000,
+  "timezone": "Africa/Lagos",
+  "delaySeconds": [5, 15],
+  "statusRecipients": [],
+  "groupLists": {},
+  "jobs": []
+}
