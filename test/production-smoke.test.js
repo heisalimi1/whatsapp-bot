@@ -301,12 +301,15 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     method: 'POST', headers: messageHeaders,
     body: JSON.stringify({ name: 'Missing viewers', messageId, toStatus: true, repeatCount: 1, delaySeconds: [0, 0], scheduleAt: future })
   })
-  assert.equal(missingAudience.status, 400)
-  assert.match((await missingAudience.json()).error, /Add status viewers/)
-  browserContext.S.cfg.statusRecipients = ['12345678901']
-  await vm.runInContext("saveData()", browserContext)
+  assert.equal(missingAudience.status, 201, 'Status can be scheduled without entering viewer numbers')
+  assert.equal((await missingAudience.json()).job.toStatus, true)
+  assert.doesNotMatch(dashboardMarkup, /textarea id="statusRecipients"|Add status viewers|Manage status viewers/)
+  assert.match(dashboardMarkup, /Sync WhatsApp contacts/)
+  const disconnectedSync = await fetch(base + '/api/accounts/' + accountIds[0] + '/contacts/sync', { method: 'POST', headers: messageHeaders, body: '{}' })
+  assert.equal(disconnectedSync.status, 409, 'contact sync needs the selected account to be connected')
   browserElement('jobMessage').value = testingMessage.id
   browserElement('jobRepeat').value = '1'
+  browserElement('jobPacing').value = 'random'
   browserElement('jobMinDelay').value = '0'
   browserElement('jobMaxDelay').value = '0'
   browserElement('jobMode').value = 'at'
@@ -338,6 +341,27 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert(savedDestinations.some(job => job.name === 'Status only' && job.toStatus && !job.toLists.length && !job.toRecipients.length), 'Status-only choice persists to disk')
   assert(savedDestinations.some(job => job.name === 'Groups and Status' && job.toStatus && job.toLists.includes('A list')), 'combined destinations persist to disk')
   assert.match(browserElement('jobCards').innerHTML, /WhatsApp Status/, 'automation cards clearly show Status')
+  browserElement('jobSendGroups').checked = false
+  browserElement('jobToStatus').checked = true
+  browserElement('jobSendContacts').checked = false
+  browserElement('jobPacing').value = 'fixed'
+  browserElement('jobSendInterval').value = '0.5'
+  browserElement('jobIntervalUnit').value = '60'
+  browserElement('jobMode').value = 'interval'
+  browserElement('jobInterval').value = '*/15 * * * *'
+  browserElement('jobName').value = 'Status every 15 minutes'
+  await vm.runInContext('createJob()', browserContext)
+  const recurringStatus = browserContext.S.cfg.jobs.find(job => job.name === 'Status every 15 minutes')
+  assert(recurringStatus)
+  assert.equal(recurringStatus.cron, '*/15 * * * *')
+  assert.deepEqual(Array.from(recurringStatus.delaySeconds), [30, 30], 'fixed interval in minutes converts to persisted seconds')
+  await vm.runInContext('loadState()', browserContext)
+  assert.equal(browserContext.S.cfg.jobs.find(job => job.id === recurringStatus.id).cron, '*/15 * * * *', 'the recurring interval remains after refresh')
+  browserElement('jobSendInterval').value = '-1'
+  browserElement('jobName').value = 'Invalid sending interval'
+  await vm.runInContext('createJob()', browserContext)
+  assert.match(browserElement('jobFeedback').textContent, /Choose a sending interval/)
+  browserElement('jobPacing').value = 'random'
   browserElement('jobSendGroups').checked = false
   browserElement('jobToStatus').checked = false
   browserElement('jobSendContacts').checked = false

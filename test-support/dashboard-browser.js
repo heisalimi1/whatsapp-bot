@@ -90,6 +90,18 @@ export async function checkDashboardBrowser({ base, cookie, accountId, messageId
       assert.equal(saved.toStatus, status)
       assert.deepEqual(saved.toLists, groups ? ['A list'] : [])
     }
+    await evaluate('(function(){document.getElementById("jobName").value="Browser interval Status";' +
+      'for(const [id,on] of [["jobSendGroups",false],["jobToStatus",true]]){const input=document.getElementById(id);if(input.checked!==on)input.click()}' +
+      'document.getElementById("jobPacing").value="fixed";pacingMode();document.getElementById("jobSendInterval").value="30";' +
+      'document.getElementById("jobIntervalUnit").value="60";document.getElementById("jobIntervalUnit").dispatchEvent(new Event("change",{bubbles:true}));' +
+      'document.getElementById("jobMode").value="interval";scheduleMode();document.getElementById("jobInterval").value="*/15 * * * *";updateJobSummary();})()')
+    assert.equal(await evaluate('document.getElementById("jobSendInterval").value'), '0.5', 'changing seconds to minutes keeps the chosen interval')
+    assert.equal(await evaluate('getComputedStyle(document.getElementById("fixedPacing")).display !== "none"'), true)
+    await evaluate('document.getElementById("createJobButton").click()')
+    await waitFor(() => evaluate('S.cfg.jobs.some(job=>job.name==="Browser interval Status")&&!document.getElementById("createJobButton").disabled'), 'The browser did not save the recurring Status interval')
+    const intervalJob = await evaluate('S.cfg.jobs.find(job=>job.name==="Browser interval Status")')
+    assert.deepEqual(intervalJob.delaySeconds, [30, 30])
+    assert.equal(intervalJob.cron, '*/15 * * * *')
     await command('Page.reload', { ignoreCache: true })
     await waitFor(() => evaluate('typeof S !== "undefined" && S && !!S.cfg && S.cfg.jobs.some(job=>job.name==="Browser Status only")'), 'Browser automation data did not survive refresh.')
     await evaluate('showView("jobs");document.getElementById("jobMessage").value=' + JSON.stringify(messageId) + ';document.getElementById("jobToStatus").click();document.querySelector(".jobList").click();updateJobSummary()')

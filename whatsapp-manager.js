@@ -3,6 +3,7 @@ import pino from 'pino'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
+import { StatusAudience } from './status-audience.js'
 
 const DATA_FILE = path.resolve('accounts.json')
 const DATA_DIR = path.resolve('accounts')
@@ -20,7 +21,7 @@ function now() { return new Date().toISOString() }
 function safePhone(phone) { return String(phone || '').replace(/\D/g, '') }
 function publicAccount(entry) {
   const { id, name, phone, status, createdAt, updatedAt, lastConnectedAt, everConnected, lastError } = entry
-  return { id, name, phone: phone ? `${'*'.repeat(Math.max(0, phone.length - 4))}${phone.slice(-4)}` : '', status, createdAt, updatedAt, lastConnectedAt: lastConnectedAt || null, everConnected: !!everConnected, ...(lastError ? { error: lastError } : {}) }
+  return { id, name, phone: phone ? `${'*'.repeat(Math.max(0, phone.length - 4))}${phone.slice(-4)}` : '', status, createdAt, updatedAt, lastConnectedAt: lastConnectedAt || null, everConnected: !!everConnected, statusAudience: entry.audience?.summary() || { contactCount: 0, syncedAt: null, syncing: false }, ...(lastError ? { error: lastError } : {}) }
 }
 function persist() {
   fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 })
@@ -80,6 +81,7 @@ async function startEntry(entry, { pairing = false } = {}) {
       }
       fs.mkdirSync(entry.authDir, { recursive: true, mode: 0o700 })
       secureAuthDirectory(entry.authDir)
+      try { entry.audience ||= new StatusAudience(accountDir) } catch { entry.audience = null }
       const { state, saveCreds } = await useMultiFileAuthState(entry.authDir)
       const { version } = await fetchLatestBaileysVersion()
       if (stopping || !entry.wantConnection) { finish(makeError('WhatsApp connection manager is shutting down.'), null); return }
@@ -87,6 +89,12 @@ async function startEntry(entry, { pairing = false } = {}) {
       entry.sock = sock
       entry.saveCreds = saveCreds
       entry.pairRequested = false
+      const updateContacts = contacts => { try { entry.audience?.updateContacts(contacts) } catch {} }
+      sock.ev.on('contacts.upsert', updateContacts)
+      sock.ev.on('contacts.update', updateContacts)
+      sock.ev.on('messaging-history.set', ({ contacts }) => updateContacts(contacts))
+      sock.ev.on('settings.update', ({ setting, value }) => { if (setting === 'statusPrivacy') { try { entry.audience?.updatePrivacy(value) } catch {} } })
+      sock.ev.on('lid-mapping.update', ({ lid, pn }) => updateContacts([{ id: lid, phoneNumber: pn }, { id: pn, lid }]))
       sock.ev.on('creds.update', async () => {
         try { await saveCreds(); entry.updatedAt = now(); persist() }
         catch (e) { setStatus(entry, 'authentication_failure', 'Could not save WhatsApp session data') }
@@ -104,6 +112,7 @@ async function startEntry(entry, { pairing = false } = {}) {
           entry.lastConnectedAt = now()
           entry.everConnected = true
           setStatus(entry, 'connected')
+          entry.audience?.sync(sock).catch(() => {})
           Promise.resolve(connectionListener(sock, entry.id)).catch(() => {})
           finish(null, null)
         }
@@ -174,6 +183,18 @@ export async function listAccounts(ownerId) { await loadAccounts(); return [...e
 export async function getAccount(id) { await loadAccounts(); const e = entries.get(id); return e ? publicAccount(e) : null }
 export async function ownsAccount(id, ownerId) { await loadAccounts(); return entries.get(id)?.ownerId === ownerId }
 export async function getAccountSocket(id) { await loadAccounts(); return entries.get(id)?.status === 'connected' ? entries.get(id).sock : null }
+export async function syncAccountContacts(id) {
+  const sock = await getAccountSocket(id), entry = entries.get(id)
+  if (!sock) throw makeError('Connect this WhatsApp account before syncing its contacts.')
+  if (!entry.audience) throw makeError('Could not load this account\'s contact storage. Reconnect WhatsApp and try again.')
+  return entry.audience.sync(sock)
+}
+export async function getAccountStatusAudience(id) {
+  const sock = await getAccountSocket(id), entry = entries.get(id)
+  if (!sock) throw makeError('Connect this WhatsApp account before posting to Status.')
+  if (!entry.audience) throw makeError('Could not load this account\'s contact storage. Reconnect WhatsApp and try again.')
+  return entry.audience.audience(sock)
+}
 export async function getPrimarySocket() {
   await loadAccounts()
   // Stage 2 keeps the existing global automation bound to the first account; Stage 3 can add per-account job ownership.
@@ -253,6 +274,7 @@ export async function closeAllAccounts() {
   for (const entry of entries.values()) {
     entry.wantConnection = false
     clearTimeout(entry.retryTimer)
+    try { entry.audience?.flush() } catch {}
     const sock = entry.sock
     entry.sock = null
     if (sock) await sock.end(undefined).catch(() => {})

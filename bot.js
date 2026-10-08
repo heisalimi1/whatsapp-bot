@@ -4,7 +4,7 @@ import crypto from 'crypto'
 import https from 'https'
 import fs from 'fs'
 import path from 'path'
-import { listAccounts, getAccountSocket, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected } from './whatsapp-manager.js'
+import { listAccounts, getAccountSocket, getAccountStatusAudience, syncAccountContacts, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected } from './whatsapp-manager.js'
 import { loadAutomation, saveAutomation, makeId } from './automation-store.js'
 import { normalizeDestinations, buildDeliveryPlan, sendDelivery } from './automation-delivery.js'
 import { allowRate, tokensMatch } from './dashboard-security.js'
@@ -294,7 +294,7 @@ async function executeJob(accountId, jobId, { oneShot = false, resumeProgress = 
     job.status = 'failed'; job.lastError = 'Job repeat count or delivery delay is invalid.'; saveAccountData(accountId, data); return
   }
   let deliveries
-  try { deliveries = buildDeliveryPlan(targets, data.statusRecipients || [], job, repeat) }
+  try { deliveries = buildDeliveryPlan(targets, job.toStatus ? await getAccountStatusAudience(accountId) : [], job, repeat) }
   catch (e) { job.status = 'failed'; job.lastError = e.message; saveAccountData(accountId, data); return }
   const [minD, maxD] = delays.map(Number)
   const previousProgress = Math.max(0, Math.min(job.progress || 0, deliveries.length))
@@ -677,6 +677,12 @@ function startDashboard() {
       res.json({ groups })
     } catch { res.status(502).json({ error: 'Unable to load groups from WhatsApp. Please retry.' }) }
   })
+  app.post('/api/accounts/:id/contacts/sync', async (req, res) => {
+    if (!await getAccountSocket(req.params.id)) return res.status(409).json({ error: 'Connect this WhatsApp account before syncing contacts.' })
+    if (!allowRate(req.user.id, `contacts-sync:${req.params.id}`, 4, 60 * 1000)) return res.status(429).json({ error: 'Contacts are syncing. Please wait a moment before trying again.' })
+    try { res.json({ ok: true, audience: await syncAccountContacts(req.params.id), message: 'WhatsApp contacts synced. Status uses your phone\'s privacy settings.' }) }
+    catch { res.status(502).json({ error: 'WhatsApp contacts could not be synced yet. Please wait a moment and retry.' }) }
+  })
   app.put('/api/accounts/:id/group-lists/:name', async (req, res) => {
     try {
       const name = String(req.params.name || '').trim(), body = req.body || {}
@@ -927,28 +933,30 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 <div class="form-step"><h2><span class="step-number">2</span>Where should it go?</h2><p class="help">Choose Groups, WhatsApp Status, or select both to send to both places.</p>
 <div class="destination-grid">
 <label id="groupChoice" class="destination-choice selected"><input id="jobSendGroups" type="checkbox" checked onchange="destinationMode()"><span><strong>Send to groups</strong><small>Deliver to the group lists you choose.</small></span></label>
-<label id="statusChoice" class="destination-choice"><input id="jobToStatus" type="checkbox" onchange="destinationMode()"><span><strong>Post to WhatsApp Status</strong><small>Share a status update with your saved viewers.</small></span></label>
+<label id="statusChoice" class="destination-choice"><input id="jobToStatus" type="checkbox" onchange="destinationMode()"><span><strong>Post to WhatsApp Status</strong><small>Use your WhatsApp contacts. No numbers to enter.</small></span></label>
 </div>
 <div id="jobGroupPanel" class="destination-panel"><div id="jobTargets" class="target-options"></div><button class="secondary" onclick="showView('groups')">Manage group lists</button></div>
-<div id="jobStatusPanel" class="destination-panel hidden"><div class="status-help"><strong>Status audience</strong><p id="jobStatusAudience" class="help"></p><small>Status is posted once per run. Repeats apply to group and contact messages.</small><br><button class="secondary" onclick="showView('settings');document.getElementById('statusRecipients').focus()">Manage status viewers</button></div></div>
+<div id="jobStatusPanel" class="destination-panel hidden"><div class="status-help"><strong>Your WhatsApp Status audience</strong><p id="jobStatusAudience" class="help"></p><small>Your phone's Status privacy and blocked contacts are respected. Status is posted once per automation run.</small><br><button id="syncStatusContacts" class="secondary" onclick="syncStatusContacts()">Sync WhatsApp contacts</button></div></div>
 <label class="contacts-option"><input id="jobSendContacts" type="checkbox" onchange="destinationMode()">Send to individual contacts</label>
 <div id="jobContactPanel" class="destination-panel hidden"><div id="jobContactTargets" class="target-options"></div><button class="secondary" onclick="showView('groups')">Manage contacts</button></div></div>
 <div class="form-step"><h2><span class="step-number">3</span>Choose when to send</h2><p id="jobTimezone" class="help"></p>
-<div class="field-grid"><label>Delivery schedule<select id="jobMode" onchange="scheduleMode()"><option value="now">Send now</option><option value="at">Schedule for later</option><option value="cron">Recurring schedule</option></select></label>
+<div class="field-grid"><label>Delivery schedule<select id="jobMode" onchange="scheduleMode()"><option value="now">Send now</option><option value="at">Schedule for later</option><option value="interval">Repeat at intervals</option><option value="cron">Custom recurring schedule</option></select></label>
 <label id="dateWrap" class="hidden">Date and time<input id="jobDate" type="datetime-local"></label><label id="cronWrap" class="hidden">Cron expression<input id="jobCron" type="text" placeholder="0 9 * * *"><small>For example: 0 9 * * * runs daily at 9 AM.</small></label></div>
-<details class="advanced"><summary>Delivery settings: repeats and pacing</summary><div class="field-grid">
-<label>Group/contact repeats<input id="jobRepeat" type="number" min="1" max="100" value="1" onchange="updateJobSummary()"></label>
-<label>Minimum delay (seconds)<input id="jobMinDelay" type="number" min="0" max="600" value="5"></label>
-<label>Maximum delay (seconds)<input id="jobMaxDelay" type="number" min="0" max="600" value="15"></label></div><p class="help">A random delay between deliveries helps pace your campaign.</p></details></div>
+<label id="intervalWrap" class="hidden">Repeat schedule<select id="jobInterval" onchange="updateJobSummary()"><option value="* * * * *">Every minute</option><option value="*/5 * * * *">Every 5 minutes</option><option value="*/15 * * * *">Every 15 minutes</option><option value="*/30 * * * *">Every 30 minutes</option><option value="0 * * * *" selected>Every hour, on the hour</option><option value="0 */2 * * *">Every 2 hours</option><option value="0 */6 * * *">Every 6 hours</option><option value="0 9 * * *">Daily at 9 AM</option></select><small>Runs at clock times in your account timezone. Each run posts a new Status if selected.</small></label></div>
+<div class="form-step"><h2><span class="step-number">4</span>Set your sending interval</h2><p class="help">Choose how long to wait between messages, including between groups and repeats. The first message sends immediately when a run starts.</p>
+<div class="field-grid"><label>Interval style<select id="jobPacing" onchange="pacingMode()"><option value="fixed">Fixed interval</option><option value="random" selected>Random interval range</option></select></label><label>Group/contact repeats per run<input id="jobRepeat" type="number" min="1" max="100" value="1" onchange="updateJobSummary()"></label></div>
+<div id="fixedPacing" class="field-grid hidden"><label>Wait between sends<input id="jobSendInterval" type="number" min="0" max="600" value="10" step="0.1" oninput="updateJobSummary()"></label><label>Unit<select id="jobIntervalUnit" onchange="pacingMode()"><option value="1">Seconds</option><option value="60">Minutes</option></select></label></div>
+<div id="randomPacing" class="field-grid"><label>Minimum wait (seconds)<input id="jobMinDelay" type="number" min="0" max="600" value="5" step="0.1" oninput="updateJobSummary()"></label><label>Maximum wait (seconds)<input id="jobMaxDelay" type="number" min="0" max="600" value="15" step="0.1" oninput="updateJobSummary()"></label></div><p class="help">Up to 10 minutes between sends. A Status-only run posts once; use Repeat at intervals for regular Status updates.</p></div>
 <div class="submit-row"><span class="muted">Review your campaign summary before sending.</span><button id="createJobButton" onclick="createJob()">Send now</button></div><div id="jobFeedback" class="form-feedback" role="status" aria-live="polite"></div>
 </div>
-<aside class="card preview-panel"><span class="eyebrow">Your campaign</span><h2>Ready to send?</h2><div id="jobPreview" class="preview-text">Choose a saved message to preview it here.</div><p id="jobMediaHint" class="help"></p><div class="summary-line"><span>Destinations</span><strong id="jobDestinationSummary">Choose a destination</strong></div><div class="summary-line"><span>Schedule</span><strong id="jobScheduleSummary">Send now</strong></div><div class="summary-line"><span>Account</span><strong id="jobConnectionSummary"></strong></div><small>Your messages and audience stay separate for each WhatsApp account.</small></aside>
+<aside class="card preview-panel"><span class="eyebrow">Your campaign</span><h2>Ready to send?</h2><div id="jobPreview" class="preview-text">Choose a saved message to preview it here.</div><p id="jobMediaHint" class="help"></p><div class="summary-line"><span>Destinations</span><strong id="jobDestinationSummary">Choose a destination</strong></div><div class="summary-line"><span>Schedule</span><strong id="jobScheduleSummary">Send now</strong></div><div class="summary-line"><span>Sending interval</span><strong id="jobPacingSummary"></strong></div><div class="summary-line"><span>Account</span><strong id="jobConnectionSummary"></strong></div><small>Your messages and audience stay separate for each WhatsApp account.</small></aside>
 </div><div class="page-heading" style="margin-top:28px"><div><h2>Your automations</h2><p class="muted">Track deliveries and manage upcoming campaigns.</p></div></div><div id="jobCards"></div></section>
-<section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum delay<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum delay<input id="defaultMax" type="number" min="0" max="600"></label></div><h2>WhatsApp Status audience</h2><p class="help">Add viewers for the selected WhatsApp account, one number per line with country code. These viewers are used only for Status posts.</p><label>Status viewers<textarea id="statusRecipients" placeholder="One number per line with country code"></textarea></label><button onclick="saveSettings()">Save settings</button></div></section>
+<section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum wait (seconds)<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum wait (seconds)<input id="defaultMax" type="number" min="0" max="600"></label></div><p class="help">Use the same minimum and maximum for a fixed sending interval.</p><button onclick="saveSettings()">Save settings</button><h2>WhatsApp Status audience</h2><p class="help">Contacts sync from your WhatsApp account automatically. Manage who can see your Status in WhatsApp on your phone. You do not need to enter viewer numbers here.</p><button class="secondary" onclick="syncStatusContacts()">Sync WhatsApp contacts</button></div></section>
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 var S=null, accountId='', activeView='overview', editMessageId='', mediaPath='', pairCode='', pairAccountId='', toastTimer=null, csrfToken='';
 var groupListDrafts=new Map(),groupListOpenPanels=new Map(),renderedGroupAccountId='';
+var jobTimingAccount='',lastIntervalUnit=1;
 function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function api(url,method,body){method=method||'GET';var headers={'Content-Type':'application/json'};if(method!=='GET'&&method!=='HEAD')headers['X-CSRF-Token']=csrfToken;return fetch(url,{method:method,headers:headers,body:body===undefined?undefined:JSON.stringify(body)}).then(async function(r){if(r.status===401){location.assign('/login');throw new Error('Sign in again.')}var d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed.');return d})}
 function logout(){api('/api/logout','POST',{}).then(function(){location.assign('/login')}).catch(function(e){toast(e.message,true)})}
@@ -1059,6 +1067,23 @@ function renderGroups(){
 function addRecipient(){var phone=document.getElementById('recipientPhone').value.trim(),name=document.getElementById('recipientName').value.trim();if(!/^[+()\d\s.-]+$/.test(phone)||phone.replace(/\D/g,'').length<8||phone.replace(/\D/g,'').length>15){toast('Enter a valid number with country code.',true);return}api('/api/accounts/'+encodeURIComponent(accountId)+'/recipients','POST',{phone:phone,name:name}).then(function(){document.getElementById('recipientPhone').value='';document.getElementById('recipientName').value='';toast('Recipient added.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function removeRecipient(id){api('/api/accounts/'+encodeURIComponent(accountId)+'/recipients/'+encodeURIComponent(id),'DELETE').then(function(){toast('Recipient removed.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function jobFeedback(message,bad){var el=document.getElementById('jobFeedback');el.textContent=message;el.className='form-feedback'+(bad?' err':'');toast(message,bad)}
+function syncStatusContacts(){
+  if(!accountId){toast('Choose a WhatsApp account first.',true);return}
+  var button=document.getElementById('syncStatusContacts');button.disabled=true;button.textContent='Syncing...';
+  return api('/api/accounts/'+encodeURIComponent(accountId)+'/contacts/sync','POST',{}).then(function(d){toast(d.message);return loadState()}).catch(function(e){toast(e.message,true)}).finally(function(){button.disabled=false;button.textContent='Sync WhatsApp contacts'})
+}
+function jobDelaySeconds(){
+  if(document.getElementById('jobPacing').value==='fixed'){
+    var field=document.getElementById('jobSendInterval'),seconds=field.value.trim()===''?NaN:Number(field.value)*Number(document.getElementById('jobIntervalUnit').value);
+    return [seconds,seconds]
+  }
+  return ['jobMinDelay','jobMaxDelay'].map(function(id){var value=document.getElementById(id).value;return value.trim()===''?NaN:Number(value)})
+}
+function pacingMode(){
+  var fixed=document.getElementById('jobPacing').value==='fixed',unit=Number(document.getElementById('jobIntervalUnit').value)||1,field=document.getElementById('jobSendInterval');
+  if(unit!==lastIntervalUnit){field.value=String(Number(field.value)*lastIntervalUnit/unit);lastIntervalUnit=unit}
+  field.max=String(600/unit);document.getElementById('fixedPacing').classList.toggle('hidden',!fixed);document.getElementById('randomPacing').classList.toggle('hidden',fixed);updateJobSummary()
+}
 function destinationMode(){
   [['jobSendGroups','jobGroupPanel','groupChoice'],['jobToStatus','jobStatusPanel','statusChoice'],['jobSendContacts','jobContactPanel','']].forEach(function(item){
     var on=document.getElementById(item[0]).checked;document.getElementById(item[1]).classList.toggle('hidden',!on);if(item[2])document.getElementById(item[2]).classList.toggle('selected',on)
@@ -1072,13 +1097,15 @@ function updateJobSummary(){
   if(document.getElementById('jobSendContacts').checked)destinations.push(contacts.length+' contact'+(contacts.length===1?'':'s'));
   document.getElementById('jobDestinationSummary').textContent=destinations.join(' + ')||'Choose a destination';
   var mode=document.getElementById('jobMode').value;
-  document.getElementById('jobScheduleSummary').textContent=mode==='at'?(document.getElementById('jobDate').value.replace('T',' ')||'Choose a date and time'):mode==='cron'?(document.getElementById('jobCron').value||'Set a recurring schedule'):'Send now';
+  var intervalSelect=document.getElementById('jobInterval');
+  document.getElementById('jobScheduleSummary').textContent=mode==='at'?(document.getElementById('jobDate').value.replace('T',' ')||'Choose a date and time'):mode==='interval'?(intervalSelect.options?.[intervalSelect.selectedIndex]?.text||'Repeat at intervals'):mode==='cron'?(document.getElementById('jobCron').value||'Set a recurring schedule'):'Send now';
+  var delays=jobDelaySeconds();document.getElementById('jobPacingSummary').textContent=delays.some(function(n){return !Number.isFinite(n)})?'Choose an interval':delays[0]===delays[1]?'Wait '+delays[0]+' seconds':'Wait '+delays[0]+' to '+delays[1]+' seconds';
   var message=(S.cfg.messages||[]).find(function(m){return m.id===document.getElementById('jobMessage').value});
   document.getElementById('jobPreview').textContent=message?(message.texts||[])[0]||'Media-only message':'Choose a saved message to preview it here.';
   document.getElementById('jobMediaHint').textContent=message&&message.media?'Photo or video attached.':'';
   var account=selectedAccount();document.getElementById('jobConnectionSummary').textContent=account?account.name+' ('+account.status.replace(/_/g,' ')+')':'Select an account';
 }
-function scheduleMode(){var m=document.getElementById('jobMode').value;document.getElementById('dateWrap').classList.toggle('hidden',m!=='at');document.getElementById('cronWrap').classList.toggle('hidden',m!=='cron');document.getElementById('createJobButton').textContent=m==='now'?'Send now':'Schedule automation';updateJobSummary()}
+function scheduleMode(){var m=document.getElementById('jobMode').value;document.getElementById('dateWrap').classList.toggle('hidden',m!=='at');document.getElementById('cronWrap').classList.toggle('hidden',m!=='cron');document.getElementById('intervalWrap').classList.toggle('hidden',m!=='interval');document.getElementById('createJobButton').textContent=m==='now'?'Send now':'Schedule automation';updateJobSummary()}
 function renderJobs(){
   var d=document.getElementById('jobAccount'),accountChoice=accountId,messageSelect=document.getElementById('jobMessage'),messageChoice=messageSelect.value;
   d.innerHTML=(S.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'" '+(a.id===accountId?'selected':'')+'>'+esc(a.name)+'</option>'}).join('');d.value=accountChoice;
@@ -1087,7 +1114,8 @@ function renderJobs(){
   var selectedLists=[...document.querySelectorAll('.jobList:checked')].map(function(x){return x.value}),selectedRecipients=[...document.querySelectorAll('.jobRecipient:checked')].map(function(x){return x.value});
   document.getElementById('jobTargets').innerHTML=Object.keys(S.cfg.groupLists||{}).map(function(n){return '<label class="target-option"><input type="checkbox" class="jobList" onchange="updateJobSummary()" value="'+esc(n)+'" '+(selectedLists.includes(n)?'checked':'')+'> '+esc(n)+'<small>'+S.cfg.groupLists[n].length+(S.cfg.groupLists[n].length===1?' group':' groups')+'</small></label>'}).join('')||'<p class="help">No group lists yet. Create a list in Recipients &amp; Groups.</p>';
   document.getElementById('jobContactTargets').innerHTML=(S.cfg.recipients||[]).map(function(r){return '<label class="target-option"><input type="checkbox" class="jobRecipient" onchange="updateJobSummary()" value="'+esc(r.id)+'" '+(selectedRecipients.includes(r.id)?'checked':'')+'> '+esc(r.name||'Saved contact')+'</label>'}).join('')||'<p class="help">Add contacts in Recipients &amp; Groups.</p>';
-  var viewers=(S.cfg.statusRecipients||[]).length;document.getElementById('jobStatusAudience').textContent=viewers?viewers+' saved status viewer'+(viewers===1?'':'s')+' for this account.':'Add status viewers in Settings before posting to Status.';
+  var audience=selectedAccount()?.statusAudience||{},viewers=audience.contactCount||0;document.getElementById('jobStatusAudience').textContent=audience.syncing?'WhatsApp contacts are syncing...':viewers?viewers+' WhatsApp contacts synced. Status uses your phone\'s privacy settings.':'Contacts sync automatically after connecting. No viewer numbers to add.';
+  if(jobTimingAccount!==accountId){var delays=S.cfg.delaySeconds||[5,15];jobTimingAccount=accountId;lastIntervalUnit=1;document.getElementById('jobIntervalUnit').value='1';document.getElementById('jobPacing').value=delays[0]===delays[1]?'fixed':'random';document.getElementById('jobSendInterval').value=String(delays[0]===delays[1]?delays[0]:10);document.getElementById('jobMinDelay').value=String(delays[0]);document.getElementById('jobMaxDelay').value=String(delays[1]);pacingMode()}
   document.getElementById('jobTimezone').textContent='Recurring schedules use '+(S.cfg.timezone||'Africa/Lagos')+'. One-time schedules use your browser timezone.';
   document.getElementById('jobCards').innerHTML=(S.cfg.jobs||[]).map(function(j){
     var m=S.cfg.messages.find(function(x){return x.id===j.messageId}),prog=j.total?j.progress+'/'+j.total:'Waiting',destinations=[];
@@ -1120,18 +1148,19 @@ function createJob(){
   if(!sendGroups&&!sendContacts&&!toStatus){jobFeedback('Choose Groups, WhatsApp Status, or individual contacts.',true);return}
   if(sendGroups&&!lists.length){jobFeedback('Choose at least one group list, or turn off Send to groups.',true);return}
   if(sendContacts&&!recipients.length){jobFeedback('Choose at least one contact, or turn off individual contacts.',true);return}
-  if(toStatus&&!(S.cfg.statusRecipients||[]).length){jobFeedback('Add status viewers in Settings before posting to Status.',true);return}
-  var mode=document.getElementById('jobMode').value,body={name:document.getElementById('jobName').value.trim(),messageId:document.getElementById('jobMessage').value,toLists:lists,toRecipients:recipients,toStatus:toStatus,repeatCount:Number(document.getElementById('jobRepeat').value),delaySeconds:[Number(document.getElementById('jobMinDelay').value),Number(document.getElementById('jobMaxDelay').value)]};
+  var mode=document.getElementById('jobMode').value,body={name:document.getElementById('jobName').value.trim(),messageId:document.getElementById('jobMessage').value,toLists:lists,toRecipients:recipients,toStatus:toStatus,repeatCount:Number(document.getElementById('jobRepeat').value),delaySeconds:jobDelaySeconds()};
+  if(body.delaySeconds.some(function(n){return !Number.isFinite(n)})||body.delaySeconds[0]<0||body.delaySeconds[1]<body.delaySeconds[0]||body.delaySeconds[1]>600){jobFeedback('Choose a sending interval from 0 to 600 seconds. The maximum must be at least the minimum.',true);return}
   if(!body.name||!body.messageId){jobFeedback('Enter an automation name and choose a saved message.',true);return}
   if(mode==='at'){var date=new Date(document.getElementById('jobDate').value);if(!Number.isFinite(date.getTime())||date.getTime()<=Date.now()){jobFeedback('Choose a future date and time.',true);return}body.scheduleAt=date.toISOString()}
   if(mode==='cron'){body.cron=document.getElementById('jobCron').value.trim();if(!body.cron){jobFeedback('Enter a recurring schedule.',true);return}}
+  if(mode==='interval')body.cron=document.getElementById('jobInterval').value;
   button.disabled=true;button.textContent='Saving...';document.getElementById('jobFeedback').textContent='';
   return api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs','POST',body).then(function(d){document.getElementById('jobName').value='';jobFeedback(d.message);return loadState()}).catch(function(e){jobFeedback(e.message,true)}).finally(function(){button.disabled=false;scheduleMode()})
 }
 function jobAction(id,action){var words={start:'started',pause:'paused',resume:'resumed',cancel:'cancelled'};api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(){toast('Job '+(words[action]||action)+'.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function deleteJob(id){if(!confirm('Delete this automation?'))return;api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id),'DELETE').then(function(){toast('Job deleted.');return loadState()}).catch(function(e){toast(e.message,true)})}
-function renderSettings(){if(['timezone','defaultMin','defaultMax','statusRecipients'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1];document.getElementById('statusRecipients').value=(S.cfg.statusRecipients||[]).join('\n')}
-function saveSettings(){S.cfg.timezone=document.getElementById('timezone').value;S.cfg.delaySeconds=[Number(document.getElementById('defaultMin').value),Number(document.getElementById('defaultMax').value)];S.cfg.statusRecipients=document.getElementById('statusRecipients').value.split(/[\s,]+/).filter(Boolean);saveData('Settings saved.').catch(function(){})}
+function renderSettings(){if(['timezone','defaultMin','defaultMax'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1]}
+function saveSettings(){S.cfg.timezone=document.getElementById('timezone').value;S.cfg.delaySeconds=[Number(document.getElementById('defaultMin').value),Number(document.getElementById('defaultMax').value)];jobTimingAccount='';saveData('Settings saved.').catch(function(){})}
 fetch('/api/session').then(function(r){if(!r.ok){location.assign('/login');throw new Error('Sign in again.')}return r.json()}).then(function(x){csrfToken=x.csrfToken;return loadState()}).then(function(){showView('overview')}).catch(function(e){if(e.message!=='Sign in again.')toast(e.message,true)});setInterval(function(){if(!document.hidden&&!/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||''))refresh().catch(function(){})},5000);
 </script></body></html>`
 

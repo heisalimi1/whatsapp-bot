@@ -14,7 +14,6 @@ export function normalizeDestinations(data, body) {
   }
   if (toLists.some(name => !(data.groupLists[name] || []).length)) return { error: 'Choose group lists containing at least one group.' }
   if (!toLists.length && !toRecipients.length && !toStatus) return { error: 'Choose Groups, WhatsApp Status, or individual contacts.' }
-  if (toStatus && !(data.statusRecipients || []).length) return { error: 'Add status viewers in Settings before posting to Status.' }
   return { value: { toLists, toRecipients, toStatus } }
 }
 
@@ -25,14 +24,14 @@ export function buildDeliveryPlan(targets, statusRecipients, job, repeat) {
     throw new Error('No groups or contacts matched this automation. Refresh your groups and check the selected lists.')
   }
   if (!targets.length && !job.toStatus) throw new Error('Choose Groups, WhatsApp Status, or individual contacts.')
-  const audience = [...new Set(statusRecipients.map(value => String(value).replace(/@s\.whatsapp\.net$/, '')))]
-  if (job.toStatus && (!audience.length || audience.some(number => !/^\d{8,15}$/.test(number)))) {
-    throw new Error('Add valid status viewers in Settings before posting to Status.')
+  const audience = [...new Set(statusRecipients.map(value => /^\d{8,15}$/.test(String(value)) ? value + '@s.whatsapp.net' : String(value)))]
+  if (job.toStatus && (!audience.length || audience.some(jid => !/^\d{5,20}@(s\.whatsapp\.net|lid)$/.test(jid)))) {
+    throw new Error('WhatsApp Status contacts are not synced yet. Sync contacts for this account and try again.')
   }
   if (targets.length * repeat + (job.toStatus ? 1 : 0) > 10000) throw new Error('This job exceeds the 10,000 delivery safety limit.')
   const deliveries = []
   for (let r = 0; r < repeat; r++) for (const target of targets) deliveries.push({ ...target, kind: 'message' })
-  if (job.toStatus) deliveries.push({ jid: 'status@broadcast', kind: 'status', statusJidList: audience.map(number => number + '@s.whatsapp.net') })
+  if (job.toStatus) deliveries.push({ jid: 'status@broadcast', kind: 'status', statusJidList: audience })
   return deliveries
 }
 
