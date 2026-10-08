@@ -4,7 +4,7 @@
 
 Implemented in the existing Node/Express/Baileys application. The dashboard, scheduler, delivery engine, authentication, media uploads and existing account storage remain in place. No new runtime dependencies are required.
 
-Production has not been restarted, migrated, restored or otherwise changed by this work. Section 7 of the attached request requires approval before a deployment that could interrupt sessions. SSH subsequently timed out on port 22; public HTTPS still redirects successfully to the login page.
+After the user approved deployment/recovery and restored SSH access, code commit `54dc930b200868608b7afe7459010107094e4879` was deployed to EC2. A fresh private backup was taken after graceful PM2 stop. Both dashboard users, their active login sessions, environment values and existing private files passed preservation checks. PM2 is online with one fork, and the additive workspace migration completed. No existing WhatsApp session directory was overwritten or deleted.
 
 ## Findings
 
@@ -50,7 +50,11 @@ Local Node.js 24: `npm.cmd test` exercises twelve test cases, including a broad 
 
 The manager uses fake Baileys sockets and fixture credentials to prove one-socket concurrency, stale event protection, registered-session restart, genuine logout/new generation behavior, old auth preservation, transient failures and intentional disconnect during startup. No real WhatsApp send or pairing was performed in these tests. Browser runtime exceptions and console errors are checked; test process output is checked for fixture password leakage.
 
-Production uses Node.js 22.23.3 with one PM2 fork. An attempt to transfer a public-code-only test bundle for isolated EC2 runtime checks failed because SSH port 22 timed out. No bundle was deployed into the application directory. Exact EC2-runtime and restored-session verification remain pending access and deployment approval.
+Production uses Node.js 22.23.3 with one PM2 fork. SSH was initially blocked, then became reachable after the user checked access. All twelve tests passed in an isolated EC2 directory with production dependencies and fixture databases. Chromium was unavailable on EC2; real browser coverage ran on Windows, while server/API/lifecycle/recovery coverage ran on both runtimes.
+
+Following deployment, public login/signup returned HTTP 200. Authenticated dashboard, state, health and authorization requests passed through the local HTTPS Nginx proxy with full certificate validation for the public IP. Both users retained separate business access. Temporary verification sessions were removed after testing. HTTP Basic Auth issued no challenge. Recent server logs had no unhandled failure or startup error indicators.
+
+Immediately before deployment, the live account registry contained zero WhatsApp accounts and two dashboard users. The approved recovery tool therefore performed no writes. During subsequent verification, a new account using the former number appeared under the second user, with a different account UUID and business owner. It reported `logged_out` and `requiresPairing: true`. The original backup still has registered auth credentials, one saved message and two automations belonging to the original user's business. Restoring or transferring those records would require a separate ownership decision; they were not merged into the other business or used to create a duplicate connection.
 
 ## Prepared deployment and recovery order
 
