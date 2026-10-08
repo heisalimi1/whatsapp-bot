@@ -479,7 +479,6 @@ function startDashboard() {
   const remoteBind = !['127.0.0.1', '::1', 'localhost'].includes(host)
   app.disable('x-powered-by')
   if (process.env.DASHBOARD_TRUST_PROXY === 'loopback') app.set('trust proxy', 'loopback')
-  app.use('/api/login', (req, res, next) => allowRate(req.ip || req.socket.remoteAddress || 'unknown', 'login-traffic', 30, 15 * 60 * 1000) ? next() : res.status(429).json({ error: 'Too many sign-in requests. Try again later.' }))
   app.use(express.json({ limit: '24mb' }))
   app.use((req, res, next) => {
     res.set({
@@ -536,8 +535,6 @@ function startDashboard() {
     }
   })
   app.post('/api/login', async (req, res) => {
-    const ip = req.ip || req.socket.remoteAddress || 'unknown'
-    if (!allowRate(ip, 'login', 10, 15 * 60 * 1000)) return res.status(429).json({ error: 'Too many sign-in attempts. Please try again later.' })
     if (!sameOrigin(req)) return res.status(403).json({ error: 'Please refresh the page and try again.' })
     const email = req.body?.email, password = req.body?.password
     if (!validEmail(email) || typeof password !== 'string' || password.length > 128) return res.status(401).json({ error: 'Email or password is incorrect.' })
