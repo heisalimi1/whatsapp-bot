@@ -83,6 +83,16 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   }))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
 
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (input, init = {}) => {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 10000)
+    return originalFetch(input, { ...init, signal: controller.signal }).catch(error => {
+      if (controller.signal.aborted) throw new Error('HTTP smoke request timed out: ' + input)
+      throw error
+    }).finally(() => clearTimeout(timeout))
+  }
+  t.after(() => { globalThis.fetch = originalFetch })
   const base = `http://127.0.0.1:${port}`
   let app = launch(dir, port)
   t.after(context => {
@@ -192,6 +202,53 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   }
   await putAccount(accountIds[0], 'A')
   await putAccount(accountIds[1], 'B')
+  const messageHeaders = { ...proxyHeaders, origin: 'https://127.0.0.1:' + port, 'x-csrf-token': csrfToken, 'content-type': 'application/json' }
+  let messageResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/messages', {
+    method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ name: 'Saved from Messages page', texts: ['Saved text for automation'], media: '' })
+  })
+  assert.equal(messageResponse.status, 201, 'the authenticated account can save a new message')
+  const createdMessage = (await messageResponse.json()).savedMessage
+  assert.match(createdMessage.id, /^[a-f0-9-]{36}$/i, 'the server assigns a message ID without browser crypto')
+  const refreshedState = await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: proxyHeaders })).json()
+  assert.deepEqual(refreshedState.cfg.messages.find(message => message.id === createdMessage.id).texts, ['Saved text for automation'], 'the saved message remains after reloading account state')
+  const editResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/messages/' + createdMessage.id, {
+    method: 'PUT', headers: messageHeaders,
+    body: JSON.stringify({ name: 'Saved from Messages page', texts: ['Updated saved text'], media: '' })
+  })
+  assert.equal(editResponse.status, 200, 'editing a saved message succeeds')
+  assert.equal((await editResponse.json()).savedMessage.id, createdMessage.id, 'editing preserves the selected message ID')
+  const editedState = await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: proxyHeaders })).json()
+  assert.deepEqual(editedState.cfg.messages.find(message => message.id === createdMessage.id).texts, ['Updated saved text'], 'message edits persist after reload')
+
+  const dashboardMarkup = await (await fetch(base, { headers: proxyHeaders, redirect: 'manual' })).text()
+  assert.match(dashboardMarkup, /messageSelect\.innerHTML=\(S\.cfg\.messages\|\|\[\]\)\.map/, 'Automations renders saved account messages as selectable options')
+  assert(dashboardMarkup.includes("var target='/api/accounts/'+encodeURIComponent(accountId)+'/messages'"), 'Save Message uses the account-scoped message API')
+
+  const mediaUpload = await fetch(base + '/api/upload', {
+    method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ accountId: accountIds[0], name: 'message-test.png', data: 'iVBORw0KGgo=' })
+  })
+  assert.equal(mediaUpload.status, 200, 'the existing account media upload route still works')
+  const mediaPath = (await mediaUpload.json()).path
+  const mediaMessageResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/messages', {
+    method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ name: 'Uploaded media message', texts: [], media: mediaPath })
+  })
+  assert.equal(mediaMessageResponse.status, 201, 'a message can still save uploaded media')
+
+  const automationResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/jobs', {
+    method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({
+      name: 'Select saved message', messageId: createdMessage.id, toLists: [], toRecipients: [recipientId],
+      repeatCount: 1, delaySeconds: [0, 0], scheduleAt: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    })
+  })
+  assert.equal(automationResponse.status, 201, 'the saved message can be selected for an automation')
+  assert.equal((await automationResponse.json()).job.messageId, createdMessage.id)
+  const finalRefreshedState = await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: proxyHeaders })).json()
+  assert(finalRefreshedState.cfg.messages.some(message => message.id === createdMessage.id), 'the message remains available after another refresh')
+  assert(finalRefreshedState.cfg.jobs.some(job => job.messageId === createdMessage.id), 'the automation retains the selected saved message')
 
   response = await fetch(`${base}/api/signup`, {
     method: 'POST', headers: { 'content-type': 'application/json', origin: base },
@@ -260,7 +317,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal(stateB.cfg.messages[0].texts[0], 'private B')
   assert.deepEqual(Object.keys(stateA.cfg.groupLists), ['A list'])
   assert.deepEqual(Object.keys(stateB.cfg.groupLists), ['B list'])
-  assert.equal(stateA.cfg.jobs[0].status, 'cancelled')
+  assert.equal(stateA.cfg.jobs.find(job => job.id === lifecycleJobId).status, 'cancelled')
   assert.equal(stateB.cfg.jobs[0].status, 'scheduled')
   assert.equal(JSON.stringify(stateA).includes(passwordA), false)
   assert.match((await (await fetch(base, { headers: { cookie: cookiePair } })).text()), /Connect WhatsApp/)
@@ -276,7 +333,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const restartedB = await (await fetch(`${base}/api/state?accountId=${accountIds[1]}`, { headers: { cookie: restartCookie } })).json()
   assert.equal(restartedA.cfg.messages[0].texts[0], 'private A')
   assert.equal(restartedB.cfg.messages[0].texts[0], 'private B')
-  assert.equal(restartedA.cfg.jobs[0].status, 'cancelled')
+  assert.equal(restartedA.cfg.jobs.find(job => job.id === lifecycleJobId).status, 'cancelled')
   assert.equal(restartedB.cfg.jobs[0].status, 'scheduled')
   assert.equal(restartedB.cfg.jobs[0].scheduleAt, future)
   await stop(app.child)

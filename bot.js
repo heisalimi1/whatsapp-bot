@@ -166,6 +166,14 @@ function mediaFileFor(accountId, media) {
   throw new Error('Media must be an existing file in an allowed media directory.')
 }
 
+function validateMessageInput(body, id = makeId()) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'Enter a valid message.' }
+  const name = String(body.name || '').trim()
+  const texts = (Array.isArray(body.texts) ? body.texts : []).map(text => String(text).trim().slice(0, 10000)).filter(Boolean).slice(0, 50)
+  const media = String(body.media || '').trim()
+  if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name) || (!texts.length && !media)) return { error: 'Enter a message name and text or uploaded media.' }
+  return { value: { id, name, texts, media } }
+}
 function buildContent(job, text, accountId) {
   const file = job.media || job.image
   if (!file) return { text }
@@ -689,6 +697,46 @@ function startDashboard() {
       saveAccountData(req.params.id, data); scheduleAccount(req.params.id, data); res.json({ ok: true })
     } catch (e) { log('Unable to remove recipient:', e?.message || 'unknown error'); res.status(400).json({ error: 'Unable to remove this recipient.' }) }
   })
+  app.post('/api/accounts/:id/messages', async (req, res) => {
+    try {
+      const data = await dataFor(req.params.id)
+      if (data.messages.length >= 500) return res.status(409).json({ error: 'This account has reached its saved message limit.' })
+      const checked = validateMessageInput(req.body)
+      if (checked.error) return res.status(400).json({ error: checked.error })
+      if (checked.value.media) {
+        try { mediaFileFor(req.params.id, checked.value.media) }
+        catch { return res.status(400).json({ error: 'Choose media uploaded for this account.' }) }
+      }
+      const now = new Date().toISOString()
+      const message = { ...checked.value, createdAt: now, updatedAt: now }
+      data.messages.push(message)
+      saveAccountData(req.params.id, data)
+      res.status(201).json({ ok: true, message: 'Message saved successfully.', savedMessage: message })
+    } catch (e) {
+      log('Unable to create account message:', e?.message || 'unknown error')
+      res.status(500).json({ error: 'Unable to save this message. Please try again.' })
+    }
+  })
+  app.put('/api/accounts/:id/messages/:messageId', async (req, res) => {
+    try {
+      const data = await dataFor(req.params.id)
+      const index = data.messages.findIndex(message => message.id === req.params.messageId)
+      if (index < 0) return res.status(404).json({ error: 'Message not found for this account.' })
+      const checked = validateMessageInput(req.body, req.params.messageId)
+      if (checked.error) return res.status(400).json({ error: checked.error })
+      if (checked.value.media) {
+        try { mediaFileFor(req.params.id, checked.value.media) }
+        catch { return res.status(400).json({ error: 'Choose media uploaded for this account.' }) }
+      }
+      const message = { ...checked.value, createdAt: data.messages[index].createdAt, updatedAt: new Date().toISOString() }
+      data.messages[index] = message
+      saveAccountData(req.params.id, data)
+      res.json({ ok: true, message: 'Message saved successfully.', savedMessage: message })
+    } catch (e) {
+      log('Unable to update account message:', e?.message || 'unknown error')
+      res.status(500).json({ error: 'Unable to save this message. Please try again.' })
+    }
+  })
   app.put('/api/accounts/:id/data', async (req, res) => {
     try {
       const previous = await dataFor(req.params.id)
@@ -862,7 +910,7 @@ function removeAccount(id){if(!confirm('Remove this account and its session data
 function newMessage(){editMessageId='';mediaPath='';document.getElementById('messageFormTitle').textContent='Create message';document.getElementById('messageName').value='';document.getElementById('messageText').value='';document.getElementById('mediaLabel').textContent=''}
 function renderMessages(){if(!S.cfg)return;document.getElementById('messageCards').innerHTML=(S.cfg.messages||[]).map(function(m){var text=(m.texts||[]).join('\n---\n');return '<article class="card"><h3>'+esc(m.name)+'</h3><p class="message-preview">'+esc(text.slice(0,220))+(text.length>220?'…':'')+'</p><small>'+esc(m.media?'Media attached':'Text only')+'</small><div class="actions"><button class="secondary" onclick="editMessage(\''+esc(m.id)+'\')">Edit</button><button class="secondary" onclick="previewMessage(\''+esc(m.id)+'\')">Preview</button><button class="danger" onclick="deleteMessage(\''+esc(m.id)+'\')">Delete</button></div></article>'}).join('')||'<p class="muted">No messages saved for this account.</p>';if(!editMessageId)document.getElementById('mediaLabel').textContent=mediaPath?'Media ready: '+mediaPath:''}
 function saveData(success){if(!accountId){toast('Connect or select a WhatsApp account first.',true);return Promise.reject(new Error('No account selected.'))}return api('/api/accounts/'+encodeURIComponent(accountId)+'/data','PUT',S.cfg).then(function(){if(success)toast(success);return loadState()}).catch(function(e){toast(e.message,true);throw e})}
-function saveMessage(){var name=document.getElementById('messageName').value.trim(),raw=document.getElementById('messageText').value,texts=raw.split(/\n\s*---\s*\n/).map(function(x){return x.trim()}).filter(Boolean);if(!name||(!texts.length&&!mediaPath)){toast('Enter a message name and text or media.',true);return}var msg={id:editMessageId||crypto.randomUUID(),name:name,texts:texts,media:mediaPath,createdAt:new Date().toISOString()};var i=(S.cfg.messages||[]).findIndex(function(m){return m.id===editMessageId});if(i<0)S.cfg.messages.push(msg);else S.cfg.messages[i]={...S.cfg.messages[i],...msg};saveData('Message saved.').then(newMessage).catch(function(){})}
+function saveMessage(){var name=document.getElementById('messageName').value.trim(),raw=document.getElementById('messageText').value,texts=raw.split(/\n\s*---\s*\n/).map(function(x){return x.trim()}).filter(Boolean);if(!name||(!texts.length&&!mediaPath)){toast('Enter a message name and text or media.',true);return}if(!accountId){toast('Select a WhatsApp account first.',true);return}var button=document.querySelector('#messages .actions button');if(button.disabled)return;var target='/api/accounts/'+encodeURIComponent(accountId)+'/messages',method='POST';if(editMessageId){target+='/'+encodeURIComponent(editMessageId);method='PUT'}button.disabled=true;api(target,method,{name:name,texts:texts,media:mediaPath}).then(function(d){newMessage();toast(d.message||'Message saved successfully.');return loadState()}).catch(function(e){toast(e.message,true)}).finally(function(){button.disabled=false})}
 function editMessage(id){var m=S.cfg.messages.find(function(x){return x.id===id});if(!m)return;editMessageId=id;mediaPath=m.media||'';document.getElementById('messageFormTitle').textContent='Edit message';document.getElementById('messageName').value=m.name;document.getElementById('messageText').value=(m.texts||[]).join('\n---\n');document.getElementById('mediaLabel').textContent=mediaPath||'';showView('messages');window.scrollTo(0,0)}
 function previewMessage(id){var m=id?S.cfg.messages.find(function(x){return x.id===id}):{name:document.getElementById('messageName').value,texts:document.getElementById('messageText').value.split(/\n\s*---\s*\n/),media:mediaPath};alert((m?.name||'Message')+'\n\n'+(m?.texts||[]).join('\n\n---\n\n')+(m?.media?'\n\nMedia: '+m.media:''))}
 function deleteMessage(id){if(S.cfg.jobs.some(function(j){return j.messageId===id})){toast('This message is used by a job. Delete or edit that job first.',true);return}if(!confirm('Delete this message?'))return;S.cfg.messages=S.cfg.messages.filter(function(m){return m.id!==id});saveData('Message deleted.').catch(function(){})}
