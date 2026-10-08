@@ -45,9 +45,15 @@ export function saveAutomation(accountId, data) {
   const file = fileFor(accountId)
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${crypto.randomUUID()}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' })
+  const descriptor = fs.openSync(tmp, 'wx', 0o600)
+  try { fs.writeFileSync(descriptor, JSON.stringify(data, null, 2)); fs.fsyncSync(descriptor) }
+  finally { fs.closeSync(descriptor) }
   if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) { fs.rmSync(tmp, { force: true }); throw new Error('Account automation data cannot be a symbolic link.') }
   fs.renameSync(tmp, file)
+  if (process.platform !== 'win32') {
+    const directory = fs.openSync(path.dirname(file), 'r')
+    try { fs.fsyncSync(directory) } finally { fs.closeSync(directory) }
+  }
 }
 
 export function makeId() { return crypto.randomUUID() }

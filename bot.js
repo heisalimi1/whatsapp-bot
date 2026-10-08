@@ -6,7 +6,8 @@ import fs from 'fs'
 import path from 'path'
 import { listAccounts, getAccountSocket, getAccountStatusAudience, syncAccountContacts, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected } from './whatsapp-manager.js'
 import { loadAutomation, saveAutomation, loadGroupSnapshot, saveGroupSnapshot, makeId } from './automation-store.js'
-import { normalizeDestinations, buildDeliveryPlan, sendDelivery } from './automation-delivery.js'
+import { normalizeDestinations, buildDeliveryPlan } from './automation-delivery.js'
+import { recurring, recoverInterruptedJob, intervalMilliseconds, nextIntervalRun, parseSchedule, createDeliveryRun, dispatchDeliveryRun, runMetrics } from './recurring-schedules.js'
 import { allowRate, tokensMatch } from './dashboard-security.js'
 import { cleanupExpiredAuthRecords, closeAuthStore, consumePasswordReset, createPasswordReset, createSession, createUser, destroySession, findUser, normalizeEmail, sessionForRequest, verifyUserPassword } from './auth-store.js'
 import { sendPasswordResetEmail } from './password-reset-mailer.js'
@@ -119,6 +120,7 @@ function publicAutomation(data) {
     jobs: (data.jobs || []).map(job => ({
       id: job.id, name: job.name, messageId: job.messageId, toLists: job.toLists, toRecipients: job.toRecipients,
       repeatCount: job.repeatCount, delaySeconds: job.delaySeconds, cron: job.cron, scheduleAt: job.scheduleAt,
+      interval: job.interval || null, nextRunAt: job.nextRunAt || '', lastRunAt: job.lastRunAt || '', uncertainCount: job.uncertainCount || 0,
       toStatus: !!job.toStatus, status: job.status, progress: job.progress, total: job.total,
       createdAt: job.createdAt, scheduledAt: job.scheduledAt, startedAt: job.startedAt,
       completedAt: job.completedAt, failedCount: job.failedCount, lastError: job.lastError
@@ -224,26 +226,38 @@ async function targetsFor(accountId, data, job) {
 }
 
 function scheduleAccount(accountId, data) {
-  for (const task of cronTasks.get(accountId)?.values() || []) task.stop()
+  for (const task of cronTasks.get(accountId)?.values() || []) task.destroy()
   for (const timer of oneShotTimers.get(accountId)?.values() || []) clearTimeout(timer)
   const schedules = new Map(), timers = new Map()
   cronTasks.set(accountId, schedules); oneShotTimers.set(accountId, timers)
   if (shuttingDown) return
-  const opts = data.timezone ? { timezone: data.timezone } : {}
+  const opts = { ...(data.timezone ? { timezone: data.timezone } : {}), noOverlap: true }
   for (const job of data.jobs || []) {
-    if (['paused', 'cancelled', 'completed', 'failed'].includes(job.status)) continue
-    if (job.scheduleAt) {
+    if (['paused', 'cancelled', 'completed', 'failed', 'running'].includes(job.status)) continue
+    const unfinished = job.activeRun && !job.activeRun.finishedAt
+    if (job.interval || unfinished) {
+      if (job.interval && !job.nextRunAt) { job.nextRunAt = new Date(Date.now() + intervalMilliseconds(job.interval)).toISOString(); saveAccountData(accountId, data) }
+      const tick = async () => {
+        if (shuttingDown || job.status !== 'scheduled') return
+        const due = Math.max(unfinished ? Date.now() : Date.parse(job.nextRunAt), Date.parse(job.retryAt || '') || 0)
+        if (due > Date.now()) { timers.set(job.id, setTimeout(tick, Math.min(due - Date.now(), 2147480000))); return }
+        try { await runJob(accountId, job.id, { oneShot: !recurring(job), resumeProgress: !!unfinished, occurrenceAt: unfinished ? job.activeRun.occurrenceAt : job.nextRunAt }) }
+        catch { log('Scheduled run could not finish for job', job.id) }
+
+      }
+      timers.set(job.id, setTimeout(tick, Math.max(0, Math.min(Math.max(unfinished ? Date.now() : Date.parse(job.nextRunAt), Date.parse(job.retryAt || '') || 0) - Date.now(), 2147480000))))
+    } else if (job.scheduleAt) {
       const runAt = Date.parse(job.scheduleAt)
       if (!Number.isFinite(runAt)) continue
       const tick = () => {
         const left = runAt - Date.now()
-        if (left <= 0) { runJob(accountId, job.id, { oneShot: true }).catch(e => log('Job failed:', e.message)); return }
+        if (left <= 0) { runJob(accountId, job.id, { oneShot: true, occurrenceAt: job.scheduleAt }).catch(e => log('Job failed:', e.message)); return }
         timers.set(job.id, setTimeout(tick, Math.min(left, 2147480000)))
       }
       tick()
     } else if (job.cron && cron.validate(job.cron)) {
-      schedules.set(job.id, cron.schedule(job.cron, () => runJob(accountId, job.id).catch(e => log('Job failed:', e.message)), opts))
-    } else if (!job.cron && accountGroups.has(accountId) && job.status === 'scheduled') {
+      schedules.set(job.id, cron.schedule(job.cron, ctx => runJob(accountId, job.id, { occurrenceAt: ctx.date.toISOString() }).catch(e => log('Job failed:', e.message)), opts))
+    } else if (accountGroups.has(accountId) && job.status === 'scheduled') {
       runJob(accountId, job.id, { oneShot: true, resumeProgress: job.progress > 0 }).catch(e => log('Recovered job failed:', e.message))
     }
   }
@@ -259,6 +273,7 @@ function startJob(accountId, jobId, options = {}) {
     activeJobPromises.delete(key)
     stopRequests.delete(key)
     drainJobQueue()
+    dataFor(accountId).then(data => scheduleAccount(accountId, data)).catch(() => {})
   })
   activeJobPromises.set(key, settled)
   return settled
@@ -298,65 +313,45 @@ function cpuPercent() {
   return Math.round((micros / (elapsed * 1000)) * 1000) / 10
 }
 
-async function executeJob(accountId, jobId, { oneShot = false, resumeProgress = false } = {}) {
+async function executeJob(accountId, jobId, { oneShot = false, resumeProgress = false, occurrenceAt } = {}) {
   const key = `${accountId}:${jobId}`
-  const data = await dataFor(accountId)
-  const job = data.jobs.find(j => j.id === jobId)
-  if (!job) throw new Error('Job not found.')
-  if (['paused', 'cancelled'].includes(job.status)) throw new Error(`This job is ${job.status}.`)
+  const data = await dataFor(accountId), job = data.jobs.find(j => j.id === jobId)
+  if (!job || ['paused', 'cancelled', 'completed'].includes(job.status)) return
+  const pendingRun = job.activeRun && !job.activeRun.finishedAt
+  if (!pendingRun && occurrenceAt && job.lastOccurrenceAt && Date.parse(occurrenceAt) <= Date.parse(job.lastOccurrenceAt)) return
   const sock = await getAccountSocket(accountId)
-  if (!sock) { job.status = oneShot ? 'failed' : 'scheduled'; job.lastError = 'WhatsApp account is not connected.'; saveAccountData(accountId, data); return }
-  const message = data.messages.find(m => m.id === job.messageId) || { texts: job.texts || [job.text || ''], media: job.media || '' }
-  const targets = await targetsFor(accountId, data, job)
-
-  const rawRepeat = Number(job.repeatCount)
-  const repeat = Number.isInteger(rawRepeat) && rawRepeat >= 1 && rawRepeat <= 100 ? rawRepeat : 0
-  const delays = Array.isArray(job.delaySeconds) ? job.delaySeconds : data.delaySeconds
-  if (!repeat || !Array.isArray(delays) || delays.length !== 2 || delays.some(n => !Number.isFinite(Number(n))) || Number(delays[0]) < 0 || Number(delays[1]) < Number(delays[0]) || Number(delays[1]) > 600) {
-    job.status = 'failed'; job.lastError = 'Job repeat count or delivery delay is invalid.'; saveAccountData(accountId, data); return
+  if (!sock) { job.status = recurring(job) ? 'scheduled' : 'failed'; job.lastError = 'Waiting for WhatsApp to connect.'; job.retryAt = new Date(Date.now() + 30000).toISOString(); saveAccountData(accountId, data); return }
+  const delays = (job.delaySeconds || data.delaySeconds).map(Number)
+  if (delays.length !== 2 || delays.some(n => !Number.isFinite(n)) || delays[0] < 0 || delays[1] < delays[0] || delays[1] > 600) { job.status = 'failed'; job.lastError = 'Invalid sending interval.'; saveAccountData(accountId, data); return }
+  if (!pendingRun) {
+    try {
+      const message = data.messages.find(m => m.id === job.messageId) || { texts: job.texts || [job.text || ''], media: job.media || '' }
+      const deliveries = buildDeliveryPlan(await targetsFor(accountId, data, job), job.toStatus ? await getAccountStatusAudience(accountId) : [], job, Number(job.repeatCount))
+      job.activeRun = createDeliveryRun(occurrenceAt || new Date().toISOString(), deliveries, message, () => pickText(message, key))
+      if (resumeProgress) for (const entry of job.activeRun.entries.slice(0, job.progress || 0)) entry.state = 'sent'
+      job.lastOccurrenceAt = job.activeRun.occurrenceAt
+    } catch (e) { job.status = recurring(job) ? 'scheduled' : 'failed'; job.lastError = e.message; job.retryAt = new Date(Date.now() + 30000).toISOString(); saveAccountData(accountId, data); return }
   }
-  let deliveries
-  try { deliveries = buildDeliveryPlan(targets, job.toStatus ? await getAccountStatusAudience(accountId) : [], job, repeat) }
-  catch (e) { job.status = 'failed'; job.lastError = e.message; saveAccountData(accountId, data); return }
-  const [minD, maxD] = delays.map(Number)
-  const previousProgress = Math.max(0, Math.min(job.progress || 0, deliveries.length))
-  job.status = 'running'; job.startedAt = new Date().toISOString(); job.progress = resumeProgress ? previousProgress : 0; job.total = deliveries.length
-  if (!resumeProgress) job.failedCount = 0
-  job.lastError = ''
-  saveAccountData(accountId, data)
-  log(`Job ${job.id} started for account ${accountId}; ${job.total} deliveries queued`)
+  job.status = 'running'; job.startedAt = job.activeRun.startedAt; job.lastRunAt = new Date().toISOString(); job.lastError = ''; job.retryAt = ''; job.resumeOnRestart = false
+  Object.assign(job, runMetrics(job.activeRun)); saveAccountData(accountId, data)
+  const [minD, maxD] = delays
+  const stopped = () => shuttingDown || stopRequests.has(key) || !data.jobs.includes(job) || ['paused', 'cancelled'].includes(job.status)
   try {
-    for (let index = 0; index < deliveries.length; index++) {
-      if (index < (resumeProgress ? previousProgress : 0)) continue
-      const current = await dataFor(accountId)
-      const liveJob = current.jobs.find(j => j.id === jobId)
-      if (!liveJob || stopRequests.has(key) || liveJob.status === 'paused' || liveJob.status === 'cancelled') break
-      const delivery = deliveries[index]
-      const content = buildContent({ media: message.media }, pickText(message, key), accountId)
-      try {
-        await sendDelivery(sock, delivery, content)
-        log('Job', job.id, 'sent one', delivery.kind, 'delivery for account', accountId)
-      } catch (e) {
-        job.failedCount = (job.failedCount || 0) + 1
-        job.lastError = delivery.kind === 'status' ? 'Status post failed.' : 'One or more recipients could not be reached.'
-        log('Delivery failed for job', job.id, e.message)
-      }
-      job.progress++
-      saveAccountData(accountId, data)
-      if (job.progress < job.total && maxD > 0) await waitBetweenSends(key, (minD + Math.random() * (maxD - minD)) * 1000)
-    }
-    if (job.status === 'paused' || job.status === 'cancelled') return
-    job.completedAt = new Date().toISOString()
-    job.status = job.failedCount ? 'failed' : (job.cron && !job.scheduleAt ? 'scheduled' : 'completed')
-    if (job.status === 'completed') job.completedAt = new Date().toISOString()
+    const result = await dispatchDeliveryRun({
+      run: job.activeRun, socket: sock,
+      contentFor: entry => buildContent({ media: entry.media }, entry.text, accountId),
+      save: () => saveAccountData(accountId, data), shouldStop: stopped,
+      onProgress: () => { Object.assign(job, runMetrics(job.activeRun)); if (job.uncertainCount) job.lastError = 'A delivery was not confirmed. It is not retried automatically, to prevent duplicate posts.' },
+      wait: () => maxD > 0 ? waitBetweenSends(key, (minD + Math.random() * (maxD - minD)) * 1000) : Promise.resolve()
+    })
+    if (result.stopped) return
+    job.activeRun.finishedAt = new Date().toISOString(); job.completedAt = job.activeRun.finishedAt
+    job.status = recurring(job) ? 'scheduled' : job.failedCount ? 'failed' : 'completed'
+    if (job.interval && (!job.nextRunAt || Date.parse(job.nextRunAt) <= Date.now())) job.nextRunAt = nextIntervalRun(job.nextRunAt || job.activeRun.occurrenceAt, job.interval, Date.now())
     saveAccountData(accountId, data)
-    scheduleAccount(accountId, data)
-  } catch (e) {
-    job.status = 'failed'; job.lastError = 'Job failed. Check the server log and WhatsApp connection.'; job.completedAt = new Date().toISOString(); saveAccountData(accountId, data)
-    log('Job execution failed:', e?.message || 'unknown error')
-    scheduleAccount(accountId, data)
-    throw e
-  } finally {}
+  } catch {
+    job.status = 'failed'; job.lastError = 'Delivery progress could not be saved. Review this run before resuming.'; saveAccountData(accountId, data)
+  }
 }
 
 let reloadTimer
@@ -429,7 +424,7 @@ function validateData(b) {
     toRecipients: (Array.isArray(j.toRecipients) ? j.toRecipients : []).filter(id => recipients.some(r => r.id === id)),
     repeatCount: Number(j.repeatCount ?? 1),
     delaySeconds: Array.isArray(j.delaySeconds) ? j.delaySeconds.map(Number) : d,
-    cron: String(j.cron || '').slice(0, 100), scheduleAt: String(j.scheduleAt || '').slice(0, 40), toStatus: !!j.toStatus,
+    interval: j.interval ? { value: Number(j.interval.value), unit: j.interval.unit } : null, nextRunAt: String(j.nextRunAt || ''), cron: String(j.cron || '').slice(0, 100), scheduleAt: String(j.scheduleAt || '').slice(0, 40), toStatus: !!j.toStatus,
     status: ['scheduled', 'running', 'paused', 'cancelled', 'completed', 'failed'].includes(j.status) ? j.status : 'scheduled',
     progress: Math.max(0, Math.floor(Number(j.progress) || 0)), total: Math.max(0, Math.floor(Number(j.total) || 0)),
     createdAt: String(j.createdAt || new Date().toISOString()).slice(0, 40), scheduledAt: String(j.scheduledAt || '').slice(0, 100),
@@ -438,6 +433,7 @@ function validateData(b) {
   }))
   if (jobs.some(j => !j.name || /[\u0000-\u001f\u007f]/.test(j.name) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(j.id) || !messages.some(m => m.id === j.messageId) || !Number.isInteger(j.repeatCount) || j.repeatCount < 1 || j.repeatCount > 100) || new Set(jobs.map(j => j.id)).size !== jobs.length) return { error: 'Each job needs a unique valid name, saved message and repeat count from 1 to 100.' }
   if (jobs.some(j => j.delaySeconds.length !== 2 || j.delaySeconds.some(n => !Number.isFinite(n)) || j.delaySeconds[0] < 0 || j.delaySeconds[1] < j.delaySeconds[0] || j.delaySeconds[1] > 600)) return { error: 'A job has an invalid delivery delay.' }
+  try { for (const job of jobs) if (job.interval) { intervalMilliseconds(job.interval); if (job.cron) throw new Error('Choose an interval or a clock schedule.'); } } catch (e) { return { error: e.message } }
   if (jobs.some(j => j.cron && !cron.validate(j.cron))) return { error: 'A job has an invalid recurring schedule.' }
   if (jobs.some(j => j.repeatCount * Math.max(1, j.toRecipients.length + j.toLists.reduce((n, name) => n + (groupLists[name]?.length || 0), 0)) > 10000)) return { error: 'A job exceeds the 10,000 delivery safety limit.' }
   if ((b.statusRecipients || []).length > 5000) return { error: 'Too many status recipients.' }
@@ -473,8 +469,7 @@ async function shutdown(reason, exitCode = 0) {
         const data = await dataFor(accountId)
         const job = data.jobs.find(item => item.id === jobId)
         if (job?.status === 'running') {
-          job.status = 'paused'
-          job.lastError = 'Paused during graceful shutdown; delivery progress is saved.'
+          recoverInterruptedJob(job)
           saveAccountData(accountId, data)
         }
       } catch (e) { log('Could not save a job during shutdown:', e.message) }
@@ -836,7 +831,7 @@ function startDashboard() {
       const nextJobs = checked.value.jobs.map(j => {
         const prior = priorJobs.get(j.id)
         if (!prior) return j
-        for (const key of ['status', 'progress', 'total', 'createdAt', 'scheduledAt', 'startedAt', 'completedAt', 'failedCount', 'lastError']) if (prior[key] !== undefined) j[key] = prior[key]
+        for (const key of ['status', 'progress', 'total', 'createdAt', 'scheduledAt', 'startedAt', 'completedAt', 'failedCount', 'lastError', 'activeRun', 'lastOccurrenceAt', 'lastRunAt', 'nextRunAt', 'retryAt', 'resumeOnRestart', 'uncertainCount']) if (prior[key] !== undefined) j[key] = prior[key]
         return j
       })
       Object.assign(previous, checked.value, { jobs: nextJobs })
@@ -872,28 +867,43 @@ function startDashboard() {
     res.json({ path: path.relative(process.cwd(), file) })
   })
 
+  const jobConfiguration = (data, body) => {
+    if (!String(body.name || '').trim() || /[\u0000-\u001f\u007f]/.test(String(body.name))) throw new Error('Enter an automation name.')
+    if (!data.messages.some(m => m.id === body.messageId)) throw new Error('Choose a saved message.')
+    const destination = normalizeDestinations(data, body)
+    if (destination.error) throw new Error(destination.error)
+    const repeatCount = Number(body.repeatCount ?? 1), delaySeconds = Array.isArray(body.delaySeconds) ? body.delaySeconds.map(Number) : data.delaySeconds
+    if (!Number.isInteger(repeatCount) || repeatCount < 1 || repeatCount > 100) throw new Error('Repeat count must be between 1 and 100.')
+    if (delaySeconds.length !== 2 || delaySeconds.some(n => !Number.isFinite(n)) || delaySeconds[0] < 0 || delaySeconds[1] < delaySeconds[0] || delaySeconds[1] > 600) throw new Error('Choose a valid wait between sends, from 0 to 600 seconds.')
+    const message = data.messages.find(m => m.id === body.messageId)
+    if (destination.value.toStatus && message.media && !['.png','.jpg','.jpeg','.webp','.mp4','.mov','.mkv','.3gp'].includes(path.extname(message.media).toLowerCase())) throw new Error('Choose text, an image or a video for WhatsApp Status.')
+    return { name: String(body.name).trim().slice(0, 100), messageId: body.messageId, ...destination.value, repeatCount, delaySeconds, ...parseSchedule(body) }
+  }
   app.post('/api/accounts/:id/jobs', async (req, res) => {
     try {
-      const data = await dataFor(req.params.id), body = req.body || {}
-      if (data.jobs.length >= MAX_JOBS_PER_ACCOUNT) return res.status(409).json({ error: `This account has reached its ${MAX_JOBS_PER_ACCOUNT}-job storage limit. Remove old jobs before adding more.` })
-      if (!String(body.name || '').trim()) return res.status(400).json({ error: 'Enter a job name.' })
-      if (!data.messages.some(m => m.id === body.messageId)) return res.status(400).json({ error: 'Choose a saved message.' })
-      const destination = normalizeDestinations(data, body)
-      if (destination.error) return res.status(400).json({ error: destination.error })
-      const repeatCount = Number(body.repeatCount)
-      const delaySeconds = Array.isArray(body.delaySeconds) ? body.delaySeconds.map(Number) : data.delaySeconds
-      if (!Number.isInteger(repeatCount) || repeatCount < 1 || repeatCount > 100) return res.status(400).json({ error: 'Repeat count must be between 1 and 100.' })
-      if (delaySeconds.length !== 2 || delaySeconds.some(n => !Number.isFinite(n)) || delaySeconds[0] < 0 || delaySeconds[1] < delaySeconds[0] || delaySeconds[1] > 600) return res.status(400).json({ error: 'Enter a valid delay range from 0 to 600 seconds.' })
-      if (body.cron && !cron.validate(body.cron)) return res.status(400).json({ error: 'Enter a valid recurring schedule.' })
-      const scheduleAt = body.scheduleAt ? new Date(body.scheduleAt) : null
-      if (scheduleAt && (!Number.isFinite(scheduleAt.getTime()) || scheduleAt.getTime() <= Date.now())) return res.status(400).json({ error: 'Choose a future schedule time.' })
-      if (!scheduleAt && !body.cron && !await getAccountSocket(req.params.id)) return res.status(409).json({ error: 'Connect this WhatsApp account before starting an automation now.' })
-      const job = { id: makeId(), name: String(body.name).trim().slice(0, 100), messageId: body.messageId, ...destination.value, repeatCount, delaySeconds, cron: body.cron || '', scheduleAt: scheduleAt?.toISOString() || '', status: 'scheduled', progress: 0, total: 0, createdAt: new Date().toISOString(), scheduledAt: scheduleAt?.toISOString() || body.cron || 'Now', completedAt: '' }
-
+      const data = await dataFor(req.params.id)
+      if (data.jobs.length >= MAX_JOBS_PER_ACCOUNT) return res.status(409).json({ error: 'Remove an old schedule before adding another.' })
+      const config = jobConfiguration(data, req.body || {})
+      if (!config.interval && !config.cron && !config.scheduleAt && !await getAccountSocket(req.params.id)) return res.status(409).json({ error: 'Connect WhatsApp before sending now, or choose a future schedule.' })
+      const job = { id: makeId(), ...config, status: 'scheduled', progress: 0, total: 0, createdAt: new Date().toISOString(), completedAt: '' }
       data.jobs.push(job); saveAccountData(req.params.id, data); scheduleAccount(req.params.id, data)
-      if (!scheduleAt && !job.cron) runJob(req.params.id, job.id, { oneShot: true }).catch(e => log('Job failed:', e.message))
-      res.status(201).json({ ok: true, job, message: scheduleAt || job.cron ? 'Automation scheduled successfully.' : 'Automation started successfully.' })
-    } catch (e) { log('Unable to create automation:', e?.message || 'unknown error'); res.status(400).json({ error: 'Unable to create automation. Check its settings and try again.' }) }
+      if (!recurring(job) && !job.scheduleAt) runJob(req.params.id, job.id, { oneShot: true }).catch(() => {})
+      res.status(201).json({ ok: true, job: publicAutomation(data).jobs.find(j => j.id === job.id), message: recurring(job) || job.scheduleAt ? 'Automation scheduled successfully.' : 'Automation started successfully.' })
+    } catch (e) { res.status(400).json({ error: e.message || 'Unable to create this schedule.' }) }
+  })
+  app.put('/api/accounts/:id/jobs/:jobId', async (req, res) => {
+    try {
+      const data = await dataFor(req.params.id), job = data.jobs.find(j => j.id === req.params.jobId)
+      if (!job) return res.status(404).json({ error: 'Schedule not found.' })
+      const key = `${req.params.id}:${job.id}`
+      if (runningJobs.has(key) || queuedJobs.has(key)) return res.status(409).json({ error: 'Pause this run and wait for its current send to finish before editing.' })
+      const config = jobConfiguration(data, req.body || {})
+      if (!config.interval && !config.cron && !config.scheduleAt) return res.status(400).json({ error: 'Choose a future or recurring schedule when editing.' })
+      Object.assign(job, config, { updatedAt: new Date().toISOString(), retryAt: '' })
+      if (['completed','cancelled','failed'].includes(job.status)) job.status = 'paused'
+      saveAccountData(req.params.id, data); scheduleAccount(req.params.id, data)
+      res.json({ ok: true, job: publicAutomation(data).jobs.find(j => j.id === job.id), message: 'Schedule updated successfully.' })
+    } catch (e) { res.status(400).json({ error: e.message || 'Unable to edit this schedule.' }) }
   })
   app.post('/api/accounts/:id/jobs/:jobId/:action', async (req, res) => {
     try {
@@ -902,7 +912,7 @@ function startDashboard() {
       const key = `${req.params.id}:${job.id}`, action = req.params.action
       if (action === 'start') {
         if (runningJobs.has(key)) return res.status(409).json({ error: 'This job is already running.' })
-        job.scheduleAt = ''; job.scheduledAt = job.cron ? job.cron : 'Now'; job.status = 'scheduled'; job.lastError = ''; saveAccountData(req.params.id, data)
+        if (!recurring(job)) job.scheduleAt = ''; job.scheduledAt = job.interval ? 'Every '+job.interval.value+' '+job.interval.unit : job.cron || 'Now'; job.status = 'scheduled'; job.lastError = ''; saveAccountData(req.params.id, data)
         runJob(req.params.id, job.id, { oneShot: true }).catch(e => log('Job failed:', e.message))
       } else if (action === 'pause') {
         if (!['running', 'scheduled'].includes(job.status)) return res.status(400).json({ error: 'Only scheduled or running jobs can be paused.' })
@@ -911,9 +921,9 @@ function startDashboard() {
       else if (action === 'resume') {
         if (job.status !== 'paused') return res.status(400).json({ error: 'Only paused jobs can be resumed.' })
         job.status = 'scheduled'; stopRequests.delete(key); saveAccountData(req.params.id, data)
-        const hasProgress = job.progress > 0 && job.progress < job.total
-        const expiredOneShot = job.scheduleAt && Date.parse(job.scheduleAt) <= Date.now()
-        if (hasProgress || expiredOneShot || (!job.scheduleAt && !job.cron)) runJob(req.params.id, job.id, { oneShot: true, resumeProgress: true }).catch(e => log('Job failed:', e.message))
+        const hasProgress = (job.activeRun && !job.activeRun.finishedAt) || (job.progress > 0 && job.progress < job.total)
+        const expiredOneShot = !recurring(job) && job.scheduleAt && Date.parse(job.scheduleAt) <= Date.now()
+        if (hasProgress || expiredOneShot || (!job.scheduleAt && !recurring(job))) runJob(req.params.id, job.id, { oneShot: true, resumeProgress: true }).catch(e => log('Job failed:', e.message))
         else scheduleAccount(req.params.id, data)
       } else if (action === 'cancel') {
         if (['completed', 'cancelled'].includes(job.status)) return res.status(400).json({ error: `A ${job.status} job cannot be cancelled.` })
@@ -921,7 +931,7 @@ function startDashboard() {
       }
       else return res.status(404).json({ error: 'Unknown job action.' })
       scheduleAccount(req.params.id, data)
-      res.json({ ok: true, job })
+      res.json({ ok: true, job: publicAutomation(data).jobs.find(j => j.id === job.id) })
     } catch (e) { log('Unable to update automation:', e?.message || 'unknown error'); res.status(400).json({ error: 'Unable to update this automation.' }) }
   })
   app.delete('/api/accounts/:id/jobs/:jobId', async (req, res) => {
@@ -997,14 +1007,14 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 <label class="contacts-option"><input id="jobSendContacts" type="checkbox" onchange="destinationMode()">Send to individual contacts</label>
 <div id="jobContactPanel" class="destination-panel hidden"><div id="jobContactTargets" class="target-options"></div><button class="secondary" onclick="showView('groups')">Manage contacts</button></div></div>
 <div class="form-step"><h2><span class="step-number">3</span>Choose when to send</h2><p id="jobTimezone" class="help"></p>
-<div class="field-grid"><label>Delivery schedule<select id="jobMode" onchange="scheduleMode()"><option value="now">Send now</option><option value="at">Schedule for later</option><option value="interval">Repeat at intervals</option><option value="cron">Custom recurring schedule</option></select></label>
+<div class="field-grid"><label>Delivery schedule<select id="jobMode" onchange="scheduleMode()"><option value="now">Send now</option><option value="at">Schedule for later</option><option value="interval">Repeat at custom intervals</option><option value="preset">Repeat at clock times</option><option value="cron">Custom recurring schedule</option></select></label>
 <label id="dateWrap" class="hidden">Date and time<input id="jobDate" type="datetime-local"></label><label id="cronWrap" class="hidden">Cron expression<input id="jobCron" type="text" placeholder="0 9 * * *"><small>For example: 0 9 * * * runs daily at 9 AM.</small></label></div>
-<label id="intervalWrap" class="hidden">Repeat schedule<select id="jobInterval" onchange="updateJobSummary()"><option value="* * * * *">Every minute</option><option value="*/5 * * * *">Every 5 minutes</option><option value="*/15 * * * *">Every 15 minutes</option><option value="*/30 * * * *">Every 30 minutes</option><option value="0 * * * *" selected>Every hour, on the hour</option><option value="0 */2 * * *">Every 2 hours</option><option value="0 */6 * * *">Every 6 hours</option><option value="0 9 * * *">Daily at 9 AM</option></select><small>Runs at clock times in your account timezone. Each run posts a new Status if selected.</small></label></div>
+<div id="intervalWrap" class="hidden"><div class="field-grid"><label>Repeat every<input id="jobEvery" type="number" min="1" step="1" value="15" oninput="updateJobSummary()"></label><label>Unit<select id="jobEveryUnit" onchange="updateJobSummary()"><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></label></div><label>First run (optional)<input id="jobFirstRun" type="datetime-local"></label><p class="help">Leave blank to run after the chosen interval. Runs continue while this page is closed. Missed intervals are combined into one run after downtime.</p></div><label id="presetWrap" class="hidden">Repeat schedule<select id="jobInterval" onchange="updateJobSummary()"><option value="* * * * *">Every minute</option><option value="*/5 * * * *">Every 5 minutes</option><option value="*/15 * * * *">Every 15 minutes</option><option value="*/30 * * * *">Every 30 minutes</option><option value="0 * * * *" selected>Every hour, on the hour</option><option value="0 */2 * * *">Every 2 hours</option><option value="0 */6 * * *">Every 6 hours</option><option value="0 9 * * *">Daily at 9 AM</option></select><small>Runs at clock times in your account timezone. Each run posts a new Status if selected.</small></label></div>
 <div class="form-step"><h2><span class="step-number">4</span>Set your sending interval</h2><p class="help">Choose how long to wait between messages, including between groups and repeats. The first message sends immediately when a run starts.</p>
 <div class="field-grid"><label>Interval style<select id="jobPacing" onchange="pacingMode()"><option value="fixed">Fixed interval</option><option value="random" selected>Random interval range</option></select></label><label>Group/contact repeats per run<input id="jobRepeat" type="number" min="1" max="100" value="1" onchange="updateJobSummary()"></label></div>
 <div id="fixedPacing" class="field-grid hidden"><label>Wait between sends<input id="jobSendInterval" type="number" min="0" max="600" value="10" step="0.1" oninput="updateJobSummary()"></label><label>Unit<select id="jobIntervalUnit" onchange="pacingMode()"><option value="1">Seconds</option><option value="60">Minutes</option></select></label></div>
 <div id="randomPacing" class="field-grid"><label>Minimum wait (seconds)<input id="jobMinDelay" type="number" min="0" max="600" value="5" step="0.1" oninput="updateJobSummary()"></label><label>Maximum wait (seconds)<input id="jobMaxDelay" type="number" min="0" max="600" value="15" step="0.1" oninput="updateJobSummary()"></label></div><p class="help">Up to 10 minutes between sends. A Status-only run posts once; use Repeat at intervals for regular Status updates.</p></div>
-<div class="submit-row"><span class="muted">Review your campaign summary before sending.</span><button id="createJobButton" onclick="createJob()">Send now</button></div><div id="jobFeedback" class="form-feedback" role="status" aria-live="polite"></div>
+<div class="submit-row"><span class="muted">Review your campaign summary before sending.</span><button id="cancelJobEdit" class="secondary hidden" onclick="cancelJobEdit()">Cancel edit</button><button id="createJobButton" onclick="createJob()">Send now</button></div><div id="jobFeedback" class="form-feedback" role="status" aria-live="polite"></div>
 </div>
 <aside class="card preview-panel"><span class="eyebrow">Your campaign</span><h2>Ready to send?</h2><div id="jobPreview" class="preview-text">Choose a saved message to preview it here.</div><p id="jobMediaHint" class="help"></p><div class="summary-line"><span>Destinations</span><strong id="jobDestinationSummary">Choose a destination</strong></div><div class="summary-line"><span>Schedule</span><strong id="jobScheduleSummary">Send now</strong></div><div class="summary-line"><span>Sending interval</span><strong id="jobPacingSummary"></strong></div><div class="summary-line"><span>Account</span><strong id="jobConnectionSummary"></strong></div><small>Your messages and audience stay separate for each WhatsApp account.</small></aside>
 </div><div class="page-heading" style="margin-top:28px"><div><h2>Your automations</h2><p class="muted">Track deliveries and manage upcoming campaigns.</p></div></div><div id="jobCards"></div></section>
@@ -1013,7 +1023,7 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 <script>
 var S=null, accountId='', activeView='overview', editMessageId='', mediaPath='', pairCode='', pairAccountId='', toastTimer=null, csrfToken='';
 var groupListDrafts=new Map(),groupListOpenPanels=new Map(),renderedGroupAccountId='';
-var jobTimingAccount='',lastIntervalUnit=1,stateGeneration=0,pollInFlight=false,membersLoadedFor='';
+var jobTimingAccount='',lastIntervalUnit=1,stateGeneration=0,pollInFlight=false,membersLoadedFor='',editJobId='';
 function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function api(url,method,body){method=method||'GET';var headers={'Content-Type':'application/json'};if(method!=='GET'&&method!=='HEAD')headers['X-CSRF-Token']=csrfToken;return fetch(url,{method:method,headers:headers,body:body===undefined?undefined:JSON.stringify(body)}).then(async function(r){if(r.status===401){location.assign('/login');throw new Error('Sign in again.')}var d=await r.json();if(!r.ok){var e=new Error(d.error||'Request failed.');e.status=r.status;throw e}return d})}
 function logout(){api('/api/logout','POST',{}).then(function(){location.assign('/login')}).catch(function(e){toast(e.message,true)})}
@@ -1027,7 +1037,7 @@ function loadState(options){
   return api(url).catch(function(e){if(e.status===404&&oldAccount)return api('/api/state');throw e}).then(function(d){
     if(generation!==stateGeneration)return d;
     S=d;accountId=d.selectedAccountId||'';var changed=oldAccount!==accountId||oldWorkspace!==S.workspace?.id;
-    if(changed){pairCode='';pairAccountId='';jobTimingAccount='';document.getElementById('workspaceInviteCode').value='';}
+    if(changed){pairCode='';pairAccountId='';jobTimingAccount='';cancelJobEdit();document.getElementById('workspaceInviteCode').value='';}
     if(selectedAccount()?.status==='connected')pairCode='';
     document.getElementById('syncState').textContent='Live from server';
     if(options?.background&&!changed&&/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||''))renderLiveStatus();else render();
@@ -1193,14 +1203,14 @@ function updateJobSummary(){
   document.getElementById('jobDestinationSummary').textContent=destinations.join(' + ')||'Choose a destination';
   var mode=document.getElementById('jobMode').value;
   var intervalSelect=document.getElementById('jobInterval');
-  document.getElementById('jobScheduleSummary').textContent=mode==='at'?(document.getElementById('jobDate').value.replace('T',' ')||'Choose a date and time'):mode==='interval'?(intervalSelect.options?.[intervalSelect.selectedIndex]?.text||'Repeat at intervals'):mode==='cron'?(document.getElementById('jobCron').value||'Set a recurring schedule'):'Send now';
+  document.getElementById('jobScheduleSummary').textContent=mode==='at'?(document.getElementById('jobDate').value.replace('T',' ')||'Choose a date and time'):mode==='interval'?('Every '+document.getElementById('jobEvery').value+' '+document.getElementById('jobEveryUnit').value):mode==='preset'?(intervalSelect.options?.[intervalSelect.selectedIndex]?.text||'Repeat at intervals'):mode==='cron'?(document.getElementById('jobCron').value||'Set a recurring schedule'):'Send now';
   var delays=jobDelaySeconds();document.getElementById('jobPacingSummary').textContent=delays.some(function(n){return !Number.isFinite(n)})?'Choose an interval':delays[0]===delays[1]?'Wait '+delays[0]+' seconds':'Wait '+delays[0]+' to '+delays[1]+' seconds';
   var message=(S.cfg.messages||[]).find(function(m){return m.id===document.getElementById('jobMessage').value});
   document.getElementById('jobPreview').textContent=message?(message.texts||[])[0]||'Media-only message':'Choose a saved message to preview it here.';
   document.getElementById('jobMediaHint').textContent=message&&message.media?'Photo or video attached.':'';
   var account=selectedAccount();document.getElementById('jobConnectionSummary').textContent=account?account.name+' ('+account.status.replace(/_/g,' ')+')':'Select an account';
 }
-function scheduleMode(){var m=document.getElementById('jobMode').value;document.getElementById('dateWrap').classList.toggle('hidden',m!=='at');document.getElementById('cronWrap').classList.toggle('hidden',m!=='cron');document.getElementById('intervalWrap').classList.toggle('hidden',m!=='interval');document.getElementById('createJobButton').textContent=m==='now'?'Send now':'Schedule automation';updateJobSummary()}
+function scheduleMode(){var m=document.getElementById('jobMode').value;document.getElementById('dateWrap').classList.toggle('hidden',m!=='at');document.getElementById('cronWrap').classList.toggle('hidden',m!=='cron');document.getElementById('intervalWrap').classList.toggle('hidden',m!=='interval');document.getElementById('presetWrap').classList.toggle('hidden',m!=='preset');document.getElementById('createJobButton').textContent=editJobId?'Save schedule':m==='now'?'Send now':'Schedule automation';updateJobSummary()}
 function renderJobs(){
   var d=document.getElementById('jobAccount'),accountChoice=accountId,messageSelect=document.getElementById('jobMessage'),messageChoice=messageSelect.value;
   d.innerHTML=(S.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'" '+(a.id===accountId?'selected':'')+'>'+esc(a.name)+'</option>'}).join('');d.value=accountChoice;
@@ -1211,12 +1221,12 @@ function renderJobs(){
   document.getElementById('jobContactTargets').innerHTML=(S.cfg.recipients||[]).map(function(r){return '<label class="target-option"><input type="checkbox" class="jobRecipient" onchange="updateJobSummary()" value="'+esc(r.id)+'" '+(selectedRecipients.includes(r.id)?'checked':'')+'> '+esc(r.name||'Saved contact')+'</label>'}).join('')||'<p class="help">Add contacts in Recipients &amp; Groups.</p>';
   var audience=selectedAccount()?.statusAudience||{},viewers=audience.contactCount||0;document.getElementById('jobStatusAudience').textContent=audience.syncing?'WhatsApp contacts are syncing...':viewers?viewers+' WhatsApp contacts synced. Status uses your phone\'s privacy settings.':'Contacts sync automatically after connecting. No viewer numbers to add.';
   if(jobTimingAccount!==accountId){var delays=S.cfg.delaySeconds||[5,15];jobTimingAccount=accountId;lastIntervalUnit=1;document.getElementById('jobIntervalUnit').value='1';document.getElementById('jobPacing').value=delays[0]===delays[1]?'fixed':'random';document.getElementById('jobSendInterval').value=String(delays[0]===delays[1]?delays[0]:10);document.getElementById('jobMinDelay').value=String(delays[0]);document.getElementById('jobMaxDelay').value=String(delays[1]);pacingMode()}
-  document.getElementById('jobTimezone').textContent='Recurring schedules use '+(S.cfg.timezone||'Africa/Lagos')+'. One-time schedules use your browser timezone.';
+  document.getElementById('jobTimezone').textContent='Clock schedules use '+(S.cfg.timezone||'Africa/Lagos')+'. Repeat intervals use elapsed time; one day is 24 hours.';
   document.getElementById('jobCards').innerHTML=(S.cfg.jobs||[]).map(function(j){
     var m=S.cfg.messages.find(function(x){return x.id===j.messageId}),prog=j.total?j.progress+'/'+j.total:'Waiting',destinations=[];
     if((j.toLists||[]).length)destinations.push('Groups: '+j.toLists.join(', '));if(j.toStatus)destinations.push('WhatsApp Status');if((j.toRecipients||[]).length)destinations.push(j.toRecipients.length+' contacts');
-    var buttons='';if(j.status==='running')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='paused')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'resume\')">Resume</button>';if(j.status==='scheduled')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Start now</button>';if(!['completed','cancelled','failed'].includes(j.status))buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'cancel\')">Cancel</button>';buttons+='<button class="danger" onclick="deleteJob(\''+esc(j.id)+'\')">Delete</button>';
-    return '<article class="card"><div class="row"><h3 class="grow">'+esc(j.name)+'</h3>'+statusPill(j.status)+'</div><div class="muted">'+esc(m?.name||'Missing message')+' &middot; '+esc(prog)+' deliveries processed'+(j.failedCount?' &middot; '+j.failedCount+' failed':'')+'</div><div class="job-destinations">'+destinations.map(function(n){return '<span class="pill">'+esc(n)+'</span>'}).join('')+'</div><p class="muted">Scheduled: '+esc(j.scheduleAt?new Date(j.scheduleAt).toLocaleString():j.cron||'Now')+(j.completedAt?' &middot; Finished: '+esc(new Date(j.completedAt).toLocaleString()):'')+'</p>'+(j.lastError?'<p class="form-feedback err">'+esc(j.lastError)+'</p>':'')+'<div class="actions">'+buttons+'</div></article>'
+    var buttons='';if(j.status==='running')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='paused')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'resume\')">Resume</button>';if(j.status==='scheduled')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='scheduled')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Start now</button>';if(!['completed','cancelled','failed'].includes(j.status))buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'cancel\')">Cancel</button>';if(j.status!=='running')buttons+='<button class="secondary" onclick="editJob(\''+esc(j.id)+'\')">Edit</button>';buttons+='<button class="danger" onclick="deleteJob(\''+esc(j.id)+'\')">Delete</button>';
+    return '<article class="card"><div class="row"><h3 class="grow">'+esc(j.name)+'</h3>'+statusPill(j.status)+'</div><div class="muted">'+esc(m?.name||'Missing message')+' &middot; '+esc(prog)+' deliveries processed'+(j.failedCount?' &middot; '+j.failedCount+' failed':'')+'</div><div class="job-destinations">'+destinations.map(function(n){return '<span class="pill">'+esc(n)+'</span>'}).join('')+'</div><p class="muted">Scheduled: '+esc(j.interval?'Every '+j.interval.value+' '+j.interval.unit:j.scheduleAt?new Date(j.scheduleAt).toLocaleString():j.cron||'Now')+(j.interval&&j.nextRunAt?' &middot; Next: '+esc(new Date(j.nextRunAt).toLocaleString()):'')+(j.completedAt?' &middot; Finished: '+esc(new Date(j.completedAt).toLocaleString()):'')+'</p>'+(j.lastError?'<p class="form-feedback err">'+esc(j.lastError)+'</p>':'')+'<div class="actions">'+buttons+'</div></article>'
   }).join('')||'<div class="empty-state"><strong>Your first campaign starts here.</strong><p>Choose a message, pick its destinations, and send or schedule it above.</p></div>';
   destinationMode();scheduleMode()
 }
@@ -1248,11 +1258,25 @@ function createJob(){
   if(!body.name||!body.messageId){jobFeedback('Enter an automation name and choose a saved message.',true);return}
   if(mode==='at'){var date=new Date(document.getElementById('jobDate').value);if(!Number.isFinite(date.getTime())||date.getTime()<=Date.now()){jobFeedback('Choose a future date and time.',true);return}body.scheduleAt=date.toISOString()}
   if(mode==='cron'){body.cron=document.getElementById('jobCron').value.trim();if(!body.cron){jobFeedback('Enter a recurring schedule.',true);return}}
-  if(mode==='interval')body.cron=document.getElementById('jobInterval').value;
+  if(mode==='preset')body.cron=document.getElementById('jobInterval').value;
+  if(mode==='interval'){body.interval={value:Number(document.getElementById('jobEvery').value),unit:document.getElementById('jobEveryUnit').value};var factors={minutes:60000,hours:3600000,days:86400000};if(!Number.isInteger(body.interval.value)||body.interval.value<1||body.interval.value*factors[body.interval.unit]>31536000000){jobFeedback('Choose a whole-number repeat interval from 1 minute to 365 days.',true);return}var first=document.getElementById('jobFirstRun').value;if(first){var firstDate=new Date(first);if(!Number.isFinite(firstDate.getTime())||firstDate.getTime()<=Date.now()){jobFeedback('Choose a future first run.',true);return}body.scheduleAt=firstDate.toISOString()}}
   button.disabled=true;button.textContent='Saving...';document.getElementById('jobFeedback').textContent='';
-  return api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs','POST',body).then(function(d){document.getElementById('jobName').value='';jobFeedback(d.message);return loadState()}).catch(function(e){jobFeedback(e.message,true)}).finally(function(){button.disabled=false;scheduleMode()})
+  return api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs'+(editJobId?'/'+encodeURIComponent(editJobId):''),editJobId?'PUT':'POST',body).then(function(d){document.getElementById('jobName').value='';cancelJobEdit();jobFeedback(d.message);return loadState()}).catch(function(e){jobFeedback(e.message,true)}).finally(function(){button.disabled=false;scheduleMode()})
 }
-function jobAction(id,action){var words={start:'started',pause:'paused',resume:'resumed',cancel:'cancelled'};api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(){toast('Job '+(words[action]||action)+'.');return loadState()}).catch(function(e){toast(e.message,true)})}
+function cancelJobEdit(){editJobId='';document.getElementById('cancelJobEdit')?.classList.add('hidden');if(S?.cfg)scheduleMode()}
+function editJob(id){
+  var job=S.cfg.jobs.find(function(j){return j.id===id});if(!job)return;
+  editJobId=id;showView('jobs');document.getElementById('cancelJobEdit').classList.remove('hidden');
+  document.getElementById('jobName').value=job.name;document.getElementById('jobMessage').value=job.messageId;document.getElementById('jobRepeat').value=job.repeatCount;
+  document.getElementById('jobSendGroups').checked=!!job.toLists?.length;document.getElementById('jobSendContacts').checked=!!job.toRecipients?.length;document.getElementById('jobToStatus').checked=!!job.toStatus;
+  document.querySelectorAll('.jobList').forEach(function(el){el.checked=(job.toLists||[]).includes(el.value)});document.querySelectorAll('.jobRecipient').forEach(function(el){el.checked=(job.toRecipients||[]).includes(el.value)});
+  var date=job.scheduleAt&&Date.parse(job.scheduleAt)>Date.now()?new Date(job.scheduleAt):null;var local=date?new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16):'';
+  document.getElementById('jobMode').value=job.interval?'interval':job.cron?'cron':'at';document.getElementById('jobCron').value=job.cron||'';document.getElementById('jobDate').value=local;document.getElementById('jobFirstRun').value=local;
+  document.getElementById('jobEvery').value=job.interval?.value||15;document.getElementById('jobEveryUnit').value=job.interval?.unit||'minutes';
+  document.getElementById('jobPacing').value=job.delaySeconds[0]===job.delaySeconds[1]?'fixed':'random';document.getElementById('jobIntervalUnit').value='1';lastIntervalUnit=1;document.getElementById('jobSendInterval').value=job.delaySeconds[0];document.getElementById('jobMinDelay').value=job.delaySeconds[0];document.getElementById('jobMaxDelay').value=job.delaySeconds[1];
+  destinationMode();pacingMode();scheduleMode();jobFeedback('Edit this schedule. Changes apply to future runs; saved progress is preserved.');window.scrollTo(0,0);
+}
+function jobAction(id,action){var words={start:'started',pause:'paused',resume:'resumed',cancel:'cancelled'};return api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(){toast('Job '+(words[action]||action)+'.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function deleteJob(id){if(!confirm('Delete this automation?'))return;api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id),'DELETE').then(function(){toast('Job deleted.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function renderSettings(){renderWorkspace();if(['timezone','defaultMin','defaultMax'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1]}
 function saveSettings(){S.cfg.timezone=document.getElementById('timezone').value;S.cfg.delaySeconds=[Number(document.getElementById('defaultMin').value),Number(document.getElementById('defaultMax').value)];jobTimingAccount='';saveData('Settings saved.').catch(function(){})}
@@ -1287,7 +1311,7 @@ listAccounts().then(async accounts => {
       const data = await dataFor(account.id)
       let recovered = false
       for (const job of data.jobs) if (job.status === 'running') {
-        job.status = 'paused'; job.lastError = 'The bot restarted while this job was running. Resume continues after the last saved delivery.'; recovered = true
+        recovered = recoverInterruptedJob(job) || recovered
       }
       if (recovered) saveAccountData(account.id, data)
       scheduleAccount(account.id, data)

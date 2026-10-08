@@ -241,7 +241,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const selectedBrowserLists = [{ value: 'A list', checked: true }]
   const selectedBrowserContacts = [{ value: recipientId, checked: true }]
   const browserElement = id => {
-    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, checked: false, classList: { toggle() {} } })
+    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, checked: false, classList: { toggle() {}, add() {}, remove() {} } })
     return browserElements.get(id)
   }
   const saveButton = { disabled: false }
@@ -362,7 +362,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   browserElement('jobPacing').value = 'fixed'
   browserElement('jobSendInterval').value = '0.5'
   browserElement('jobIntervalUnit').value = '60'
-  browserElement('jobMode').value = 'interval'
+  browserElement('jobMode').value = 'preset'
   browserElement('jobInterval').value = '*/15 * * * *'
   browserElement('jobName').value = 'Status every 15 minutes'
   await vm.runInContext('createJob()', browserContext)
@@ -423,6 +423,35 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     body: JSON.stringify({ name: 'Uploaded media message', texts: [], media: mediaPath })
   })
   assert.equal(mediaMessageResponse.status, 201, 'a message can still save uploaded media')
+  const mediaMessage = (await mediaMessageResponse.json()).savedMessage
+  const videoUpload = await fetch(base + '/api/upload', { method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ accountId: accountIds[0], name: 'fixture.mp4', data: Buffer.from([0,0,0,16,102,116,121,112,109,112,52,50,0,0,0,0]).toString('base64') }) })
+  assert.equal(videoUpload.status, 200, 'video uploads remain available')
+  const videoResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/messages', { method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ name: 'Video Status fixture', texts: ['Video caption'], media: (await videoUpload.json()).path }) })
+  assert.equal(videoResponse.status, 201)
+  const videoMessage = (await videoResponse.json()).savedMessage
+  const intervalJobs = []
+  for (const [value, unit] of [[17,'minutes'],[3,'hours'],[2,'days']]) {
+    const created = await fetch(`${base}/api/accounts/${accountIds[0]}/jobs`, { method:'POST', headers:messageHeaders,
+      body:JSON.stringify({name:'Custom '+unit,messageId:unit==='hours'?mediaMessage.id:unit==='days'?videoMessage.id:testingMessage.id,toStatus:true,toLists:[],toRecipients:[],repeatCount:1,delaySeconds:[0,0],interval:{value,unit}}) })
+    assert.equal(created.status,201)
+    const job=(await created.json()).job;intervalJobs.push(job)
+    assert.deepEqual(job.interval,{value,unit});assert(Date.parse(job.nextRunAt)>Date.now())
+    assert.equal('activeRun' in job,false,'internal delivery checkpoints are not exposed through the API')
+  }
+  const editing = intervalJobs[0]
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/jobs/${editing.id}/pause`,{method:'POST',headers:messageHeaders,body:'{}'})).status,200)
+  const editedResponse=await fetch(`${base}/api/accounts/${accountIds[0]}/jobs/${editing.id}`,{method:'PUT',headers:messageHeaders,
+    body:JSON.stringify({...editing,name:'Edited custom minutes',interval:{value:23,unit:'minutes'},scheduleAt:''})})
+  assert.equal(editedResponse.status,200)
+  assert.equal((await editedResponse.json()).job.status,'paused','editing preserves the paused state')
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/jobs/${editing.id}/resume`,{method:'POST',headers:messageHeaders,body:'{}'})).status,200)
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/jobs`,{method:'POST',headers:messageHeaders,
+    body:JSON.stringify({...editing,interval:{value:0,unit:'minutes'}})})).status,400)
+  const disposable=await fetch(`${base}/api/accounts/${accountIds[0]}/jobs`,{method:'POST',headers:messageHeaders,body:JSON.stringify({...editing,name:'Delete fixture',interval:{value:1,unit:'days'}})})
+  const disposableId=(await disposable.json()).job.id
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/jobs/${disposableId}`,{method:'DELETE',headers:messageHeaders})).status,200)
 
   const automationResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/jobs', {
     method: 'POST', headers: messageHeaders,
@@ -554,6 +583,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const restartedA = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: { cookie: restartCookie } })).json()
   const restartedB = await (await fetch(`${base}/api/state?accountId=${accountIds[1]}`, { headers: { cookie: restartCookie } })).json()
   assert.equal(restartedA.cfg.messages[0].texts[0], 'private A')
+  for(const job of intervalJobs)assert(restartedA.cfg.jobs.some(saved=>saved.id===job.id&&saved.interval?.unit===job.interval.unit&&saved.nextRunAt),'custom recurring schedules and next run times survive restart')
   assert.deepEqual(restartedA.groups, secondState.groups, 'saved WhatsApp groups remain available after a backend restart')
   assert.equal(restartedB.cfg.messages[0].texts[0], 'private B')
   assert.equal(restartedA.cfg.jobs.find(job => job.id === lifecycleJobId).status, 'cancelled')

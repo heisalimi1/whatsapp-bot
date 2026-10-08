@@ -35,7 +35,7 @@ export function buildDeliveryPlan(targets, statusRecipients, job, repeat) {
   return deliveries
 }
 
-export function sendDelivery(socket, delivery, content) {
-  if (delivery.kind === 'status') return socket.sendMessage(delivery.jid, content, { statusJidList: delivery.statusJidList })
-  return socket.sendMessage(delivery.jid, content)
+export function sendDelivery(socket, delivery, content, options) {
+  if (delivery.kind === 'status') return socket.sendMessage(delivery.jid, content, { ...options, statusJidList: delivery.statusJidList })
+  return options ? socket.sendMessage(delivery.jid, content, options) : socket.sendMessage(delivery.jid, content)
 }
