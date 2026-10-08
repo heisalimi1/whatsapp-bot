@@ -287,6 +287,19 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     Error
   })
   new vm.Script(dashboardScript.slice(0, dashboardScript.indexOf("fetch('/api/session')")), { filename: 'dashboard-click-flow.js' }).runInContext(browserContext)
+  browserContext.orderingFixture = [
+    { id: 'older', createdAt: '2025-01-01T00:00:00Z' },
+    { id: 'newest-first', createdAt: '2026-01-01T00:00:00Z' },
+    { id: 'missing-date' },
+    { id: 'newest-last', createdAt: '2026-01-01T00:00:00Z' },
+    { id: 'invalid-date', createdAt: 'invalid' }
+  ]
+  const originalJobOrder = JSON.stringify(browserContext.orderingFixture)
+  assert.deepEqual(Array.from(vm.runInContext('newestJobs(orderingFixture).map(job=>job.id)', browserContext)),
+    ['newest-last', 'newest-first', 'older', 'invalid-date', 'missing-date'], 'campaigns sort newest first with deterministic ties and legacy dates')
+  assert.equal(JSON.stringify(browserContext.orderingFixture), originalJobOrder, 'display sorting preserves the stored campaign order')
+  assert.equal(vm.runInContext('newestJobs().length', browserContext), 0, 'an empty account has no campaigns')
+  delete browserContext.orderingFixture
   browserContext.accountId = accountIds[0]
   browserContext.csrfToken = csrfToken
   browserElement('messageName').value = 'testing'
@@ -361,6 +374,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert(savedDestinations.some(job => job.name === 'Status only' && job.toStatus && !job.toLists.length && !job.toRecipients.length), 'Status-only choice persists to disk')
   assert(savedDestinations.some(job => job.name === 'Groups and Status' && job.toStatus && job.toLists.includes('A list')), 'combined destinations persist to disk')
   assert.match(browserElement('jobCards').innerHTML, /WhatsApp Status/, 'automation cards clearly show Status')
+  assert.equal(browserElement('jobCards').innerHTML.match(/<h3 class="grow">([^<]*)<\/h3>/)[1], browserContext.S.cfg.jobs.at(-1).name, 'the newest saved campaign renders at the top')
   browserElement('jobSendGroups').checked = false
   browserElement('jobToStatus').checked = true
   browserElement('jobSendContacts').checked = false

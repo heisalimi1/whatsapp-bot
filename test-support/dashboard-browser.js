@@ -184,6 +184,7 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
     await evaluate('document.getElementById("createJobButton").click()')
     await waitFor(() => evaluate('S.cfg.jobs.some(job=>job.name==="Browser interval Status")&&!document.getElementById("createJobButton").disabled'), 'The browser did not save the recurring Status interval')
     const intervalJob = await evaluate('S.cfg.jobs.find(job=>job.name==="Browser interval Status")')
+    assert.equal(await evaluate('document.querySelector("#jobCards h3").textContent'), intervalJob.name, 'a new campaign immediately appears at the top')
     assert.deepEqual(intervalJob.delaySeconds, [30, 30])
     assert.deepEqual(intervalJob.interval, { value: 17, unit: 'minutes' });assert.equal(intervalJob.cron,'')
     const clickJobControl = (id, label) => '(function(){const button=[...document.querySelectorAll("#jobCards button")].find(b=>b.textContent===' + JSON.stringify(label) + '&&b.getAttribute("onclick").includes(' + JSON.stringify(id) + '));if(!button)throw Error("Missing schedule control");button.click()})()'
@@ -200,6 +201,7 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
     await mobileCommand('Page.reload', { ignoreCache: true })
     await waitFor(() => mobileEvaluate('typeof S!=="undefined"&&S?.cfg?.jobs.some(j=>j.id===' + JSON.stringify(intervalJob.id) + '&&j.interval.unit==="hours")'), 'The edited schedule did not survive mobile refresh.')
     await mobileEvaluate('showView("jobs")')
+    assert.equal(await mobileEvaluate('document.querySelector("#jobCards h3").textContent'), intervalJob.name, 'newest-first order survives refresh on another device')
     await mobileEvaluate(clickJobControl(intervalJob.id, 'Edit'))
     assert.equal(await mobileEvaluate('document.getElementById("jobIntervalUnit").value'), '3600', 'editing restores readable hour units')
     await mobileEvaluate('document.getElementById("jobEvery").value="3";document.getElementById("jobEveryUnit").value="days";document.getElementById("jobIntervalUnit").value="86400";pacingMode();document.getElementById("jobSendInterval").value="1";document.getElementById("createJobButton").click()')
