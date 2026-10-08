@@ -2,6 +2,10 @@
 
 In Automations, choose a saved message, select Groups, WhatsApp Status, Contacts, or a combination, then choose **Repeat at intervals**. Enter a whole number and select minutes, hours, or days. Text, uploaded images, and uploaded videos use the existing message/media controls. Status viewers come from the connected account's synced contacts; no manual viewer numbers are required. WhatsApp privacy rules still determine visibility.
 
+Status eligibility uses the PN/LID pairs in the authenticated contact snapshot before consulting Baileys' mapping cache. Missing mappings are resolved in bounded batches. An unrelated unmapped blocked/excluded identifier does not stop all eligible viewers: contacts whose eligibility cannot be verified are withheld individually. Custom allow lists stay restrictive and blocked/excluded contacts remain excluded across aliases. The Sync WhatsApp contacts button verifies the audience and reports eligible viewers; the authenticated preview endpoint returns counts only, never contact identifiers. Previewing does not publish a Status.
+
+One-time jobs that failed before any delivery plan or send offer **Retry**. They are not automatically replayed: multiple failed attempts might represent the same intended Status. Jobs with partial or unconfirmed delivery retain the existing progress-aware controls instead of a fresh-run Retry button.
+
 The first run defaults to one interval after saving. An optional future first-run date anchors the cadence. Intervals use elapsed time (one day = 24 hours). Existing date schedules, clock presets, and advanced cron expressions remain available.
 
 **Interval between groups** is a separate setting from campaign repetition. A fixed 5-minute sending interval means Group 1 at the start, Group 2 after 5 minutes, Group 3 after 10 minutes, and so on. Fixed spacing supports seconds, minutes, hours, or days (up to 365 days). Existing random ranges remain available up to 600 seconds. Contacts and within-run repeats use the same spacing; a Status-only run posts once without an inter-group delay. Combined runs preserve the existing order of group/contact sends followed by one Status post.

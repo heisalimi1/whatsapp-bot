@@ -122,6 +122,7 @@ function publicAutomation(data) {
       repeatCount: job.repeatCount, delaySeconds: job.delaySeconds, cron: job.cron, scheduleAt: job.scheduleAt,
       interval: job.interval || null, nextRunAt: job.nextRunAt || '', lastRunAt: job.lastRunAt || '', uncertainCount: job.uncertainCount || 0,
       nextDeliveryAt: job.activeRun && !job.activeRun.finishedAt ? job.activeRun.nextDeliveryAt || '' : '',
+      canRetry: job.status === 'failed' && !job.activeRun && !job.progress && !job.total,
       toStatus: !!job.toStatus, status: job.status, progress: job.progress, total: job.total,
       createdAt: job.createdAt, scheduledAt: job.scheduledAt, startedAt: job.startedAt,
       completedAt: job.completedAt, failedCount: job.failedCount, lastError: job.lastError
@@ -728,6 +729,14 @@ function startDashboard() {
     try { res.json({ ok: true, audience: await syncAccountContacts(req.params.id), message: 'WhatsApp contacts synced. Status uses your phone\'s privacy settings.' }) }
     catch { res.status(502).json({ error: 'WhatsApp contacts could not be synced yet. Please wait a moment and retry.' }) }
   })
+  app.get('/api/accounts/:id/status/preview', async (req, res) => {
+    try {
+      if (!await getAccountSocket(req.params.id)) return res.status(409).json({ error: 'Connect this WhatsApp account before checking Status privacy.' })
+      await getAccountStatusAudience(req.params.id)
+      const audience = (await getAccount(req.params.id)).statusAudience
+      res.json({ ok: true, audience, message: audience.eligibleCount + ' contacts can receive your Status.' + (audience.unmappedCount ? ' Contacts with unverified privacy mappings are withheld automatically.' : '') })
+    } catch (e) { res.status(409).json({ error: e.message || 'WhatsApp Status privacy could not be verified.' }) }
+  })
   app.put('/api/accounts/:id/group-lists/:name', async (req, res) => {
     try {
       const name = String(req.params.name || '').trim(), body = req.body || {}
@@ -1168,8 +1177,8 @@ function removeRecipient(id){api('/api/accounts/'+encodeURIComponent(accountId)+
 function jobFeedback(message,bad){var el=document.getElementById('jobFeedback');el.textContent=message;el.className='form-feedback'+(bad?' err':'');toast(message,bad)}
 function syncStatusContacts(){
   if(!accountId){toast('Choose a WhatsApp account first.',true);return}
-  var button=document.getElementById('syncStatusContacts');button.disabled=true;button.textContent='Syncing...';
-  return api('/api/accounts/'+encodeURIComponent(accountId)+'/contacts/sync','POST',{}).then(function(d){toast(d.message);return loadState()}).catch(function(e){toast(e.message,true)}).finally(function(){button.disabled=false;button.textContent='Sync WhatsApp contacts'})
+  var button=document.getElementById('syncStatusContacts');if(button.disabled)return;button.disabled=true;button.textContent='Syncing...';
+  return api('/api/accounts/'+encodeURIComponent(accountId)+'/status/preview').then(function(d){toast(d.message);return loadState()}).catch(function(e){toast(e.message,true)}).finally(function(){button.disabled=false;button.textContent='Sync WhatsApp contacts'})
 }
 function jobDelaySeconds(){
   if(document.getElementById('jobPacing').value==='fixed'){
@@ -1213,13 +1222,13 @@ function renderJobs(){
   var selectedLists=[...document.querySelectorAll('.jobList:checked')].map(function(x){return x.value}),selectedRecipients=[...document.querySelectorAll('.jobRecipient:checked')].map(function(x){return x.value});
   document.getElementById('jobTargets').innerHTML=Object.keys(S.cfg.groupLists||{}).map(function(n){return '<label class="target-option"><input type="checkbox" class="jobList" onchange="updateJobSummary()" value="'+esc(n)+'" '+(selectedLists.includes(n)?'checked':'')+'> '+esc(n)+'<small>'+S.cfg.groupLists[n].length+(S.cfg.groupLists[n].length===1?' group':' groups')+'</small></label>'}).join('')||'<p class="help">No group lists yet. Create a list in Recipients &amp; Groups.</p>';
   document.getElementById('jobContactTargets').innerHTML=(S.cfg.recipients||[]).map(function(r){return '<label class="target-option"><input type="checkbox" class="jobRecipient" onchange="updateJobSummary()" value="'+esc(r.id)+'" '+(selectedRecipients.includes(r.id)?'checked':'')+'> '+esc(r.name||'Saved contact')+'</label>'}).join('')||'<p class="help">Add contacts in Recipients &amp; Groups.</p>';
-  var audience=selectedAccount()?.statusAudience||{},viewers=audience.contactCount||0;document.getElementById('jobStatusAudience').textContent=audience.syncing?'WhatsApp contacts are syncing...':viewers?viewers+' WhatsApp contacts synced. Status uses your phone\'s privacy settings.':'Contacts sync automatically after connecting. No viewer numbers to add.';
+  var audience=selectedAccount()?.statusAudience||{},viewers=audience.contactCount||0;document.getElementById('jobStatusAudience').textContent=audience.syncing?'WhatsApp contacts are syncing...':Number.isInteger(audience.eligibleCount)?audience.eligibleCount+' contacts can receive your Status.'+(audience.unmappedCount?' '+audience.unmappedCount+' contacts are withheld until their privacy mappings can be verified.':''):viewers?viewers+' WhatsApp contacts synced. Status uses your phone\'s privacy settings.':'Contacts sync automatically after connecting. No viewer numbers to add.';
   if(jobTimingAccount!==accountId){var delays=S.cfg.delaySeconds||[5,15];jobTimingAccount=accountId;lastIntervalUnit=1;document.getElementById('jobIntervalUnit').value='1';document.getElementById('jobPacing').value=delays[0]===delays[1]?'fixed':'random';document.getElementById('jobSendInterval').value=String(delays[0]===delays[1]?delays[0]:10);document.getElementById('jobMinDelay').value=String(delays[0]);document.getElementById('jobMaxDelay').value=String(delays[1]);pacingMode()}
   document.getElementById('jobTimezone').textContent='Clock schedules use '+(S.cfg.timezone||'Africa/Lagos')+'. Repeat intervals use elapsed time; one day is 24 hours.';
   document.getElementById('jobCards').innerHTML=(S.cfg.jobs||[]).map(function(j){
     var m=S.cfg.messages.find(function(x){return x.id===j.messageId}),prog=j.total?j.progress+'/'+j.total:'Waiting',destinations=[];
     if((j.toLists||[]).length)destinations.push('Groups: '+j.toLists.join(', '));if(j.toStatus)destinations.push('WhatsApp Status');if((j.toRecipients||[]).length)destinations.push(j.toRecipients.length+' contacts');
-    var buttons='';if(j.status==='running')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='paused')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'resume\')">Resume</button>';if(j.status==='scheduled')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='scheduled')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Start now</button>';if(!['completed','cancelled','failed'].includes(j.status))buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'cancel\')">Cancel</button>';if(j.status!=='running')buttons+='<button class="secondary" onclick="editJob(\''+esc(j.id)+'\')">Edit</button>';buttons+='<button class="danger" onclick="deleteJob(\''+esc(j.id)+'\')">Delete</button>';
+    var buttons='';if(j.canRetry)buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Retry</button>';if(j.status==='running')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='paused')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'resume\')">Resume</button>';if(j.status==='scheduled')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='scheduled')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Start now</button>';if(!['completed','cancelled','failed'].includes(j.status))buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'cancel\')">Cancel</button>';if(j.status!=='running')buttons+='<button class="secondary" onclick="editJob(\''+esc(j.id)+'\')">Edit</button>';buttons+='<button class="danger" onclick="deleteJob(\''+esc(j.id)+'\')">Delete</button>';
     return '<article class="card"><div class="row"><h3 class="grow">'+esc(j.name)+'</h3>'+statusPill(j.status)+'</div><div class="muted">'+esc(m?.name||'Missing message')+' &middot; '+esc(prog)+' deliveries processed'+(j.failedCount?' &middot; '+j.failedCount+' failed':'')+'</div><div class="job-destinations">'+destinations.map(function(n){return '<span class="pill">'+esc(n)+'</span>'}).join('')+'</div><p class="muted">Scheduled: '+esc(j.interval?'Every '+j.interval.value+' '+j.interval.unit:j.scheduleAt?new Date(j.scheduleAt).toLocaleString():j.cron||'Now')+(j.interval&&j.nextRunAt?' &middot; Next campaign: '+esc(new Date(j.nextRunAt).toLocaleString()):'')+(j.nextDeliveryAt?' &middot; Next message: '+esc(new Date(j.nextDeliveryAt).toLocaleString()):'')+(j.completedAt?' &middot; Finished: '+esc(new Date(j.completedAt).toLocaleString()):'')+'</p>'+(j.lastError?'<p class="form-feedback err">'+esc(j.lastError)+'</p>':'')+'<div class="actions">'+buttons+'</div></article>'
   }).join('')||'<div class="empty-state"><strong>Your first campaign starts here.</strong><p>Choose a message, pick its destinations, and send or schedule it above.</p></div>';
   destinationMode();scheduleMode()

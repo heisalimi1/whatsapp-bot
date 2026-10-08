@@ -84,7 +84,9 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     recipients: [{ id: recipientId, name: 'Recipient', phone: '2348012345678' }],
     messages: [{ id: messageId, name: 'Saved', texts: ['private A'], media: '' }],
     jobs: [{ id: jobId, name: 'Interrupted', messageId, toLists: [], toRecipients: [recipientId], repeatCount: 1,
-      delaySeconds: [0, 0], cron: '', scheduleAt: '', status: 'running', progress: 1, total: 3, createdAt: now }]
+      delaySeconds: [0, 0], cron: '', scheduleAt: '', status: 'running', progress: 1, total: 3, createdAt: now },
+      { id: '66666666-6666-4666-8666-666666666666', name: 'Unsent Status', messageId, toLists: [], toRecipients: [], toStatus: true, repeatCount: 1,
+        delaySeconds: [0, 0], cron: '', scheduleAt: '', status: 'failed', progress: 0, total: 0, lastError: 'WhatsApp Status privacy contact mappings are still syncing. Please try again shortly.', createdAt: now }]
   }))
 
 
@@ -169,6 +171,8 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal(JSON.stringify(health).includes('11111111'), false, 'health does not expose account identifiers')
   const recoveredState = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: proxyHeaders })).json()
   assert.equal(recoveredState.cfg.jobs[0].status, 'paused', 'interrupted job recovers paused')
+  assert.equal(recoveredState.cfg.jobs[0].canRetry, false, 'partly sent jobs do not offer a fresh-run retry')
+  assert.equal(recoveredState.cfg.jobs[1].canRetry, true, 'a privacy-blocked job with no delivery attempts offers Retry')
   assert.equal(recoveredState.cfg.jobs[0].progress, 1, 'saved delivery progress is retained')
 
   const genericForgot = await fetch(`${base}/api/forgot-password`, {
@@ -321,6 +325,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.doesNotMatch(dashboardMarkup, /textarea id="statusRecipients"|Add status viewers|Manage status viewers/)
   assert.match(dashboardMarkup, /Sync WhatsApp contacts/)
   const disconnectedSync = await fetch(base + '/api/accounts/' + accountIds[0] + '/contacts/sync', { method: 'POST', headers: messageHeaders, body: '{}' })
+  assert.equal((await fetch(base + '/api/accounts/' + accountIds[0] + '/status/preview', { headers: proxyHeaders })).status, 409, 'Status privacy preview requires a connected account')
   assert.equal(disconnectedSync.status, 409, 'contact sync needs the selected account to be connected')
   browserElement('jobMessage').value = testingMessage.id
   browserElement('jobRepeat').value = '1'
@@ -479,6 +484,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}`, { headers: userBHeaders })).status, 404)
   assert.equal((await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: userBHeaders })).status, 404)
   assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/groups`, { headers: userBHeaders })).status, 404)
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/status/preview`, { headers: userBHeaders })).status, 404, 'Status privacy preview enforces business ownership')
   response = await fetch(`${base}/api/upload`, {
     method: 'POST', headers: { ...userBHeaders, 'content-type': 'application/json', origin: base },
     body: JSON.stringify({ accountId: accountIds[0], name: 'test.jpg', data: 'AA==' })

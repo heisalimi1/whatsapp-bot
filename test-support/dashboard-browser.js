@@ -111,6 +111,13 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
     await evaluate('(async function(){delete S.cfg.groupLists["Browser shared list"];await saveData()})()')
     await evaluate('showView("jobs");document.getElementById("jobMessage").value=' + JSON.stringify(messageId) + ';updateJobSummary()')
     assert.equal(await evaluate('document.getElementById("jobPreview").textContent'), 'hi this is test message')
+    await evaluate('window.statusPreviewFetch=window.fetch;window.statusPreviewRequests=0;window.fetch=function(url,options){if(url.endsWith("/status/preview")){window.statusPreviewRequests++;return new Promise(resolve=>{window.resolveStatusPreview=()=>resolve(new Response(JSON.stringify({ok:true,audience:{eligibleCount:12,unmappedCount:1},message:"12 contacts can receive your Status."}),{status:200,headers:{"Content-Type":"application/json"}}))})}return window.statusPreviewFetch(url,options)};syncStatusContacts();syncStatusContacts()')
+    assert.equal(await evaluate('window.statusPreviewRequests'), 1, 'parallel audience checks coalesce in the dashboard')
+    assert.equal(await evaluate('document.getElementById("syncStatusContacts").disabled'), true)
+    await evaluate('window.resolveStatusPreview()')
+    await waitFor(() => evaluate('!document.getElementById("syncStatusContacts").disabled'), 'Status eligibility check did not finish.')
+    assert.equal(await evaluate('document.getElementById("toast").textContent'), '12 contacts can receive your Status.')
+    await evaluate('window.fetch=window.statusPreviewFetch')
 
     for (const [name, groups, status] of [['Browser Groups only', true, false], ['Browser Status only', false, true], ['Browser Groups and Status', true, true]]) {
       await evaluate('(function(){document.getElementById("jobName").value=' + JSON.stringify(name) + ';' +
