@@ -257,7 +257,11 @@ async function createAccount({ userId, workspaceId = userId, name, phone }) {
   if (!/^[a-f0-9-]{36}$/i.test(String(workspaceId || ''))) throw makeError('Choose a valid business workspace.')
   const digits = safePhone(phone)
   if (!/^\d{8,15}$/.test(digits)) throw makeError('Enter a valid phone number with country code (8 to 15 digits).')
-  if ([...entries.values()].some(e => e.phone === digits)) throw makeError('This number is already configured. Use its existing account instead of pairing it twice.')
+  const existing = [...entries.values()].find(e => e.phone === digits)
+  if (existing) {
+    if (existing.workspaceId !== workspaceId) throw makeError('This number is already configured. Use its existing account instead of pairing it twice.')
+    return { ...await reconnectAccount(existing.id, { pair: existing.requiresPairing }), reused: true }
+  }
   const id = crypto.randomUUID()
   const safeName = String(name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80)
   const storageDir = path.join(DATA_DIR, userId, id)

@@ -534,8 +534,6 @@ function startDashboard() {
     res.set('Set-Cookie', `wa_dashboard_session=${encodeURIComponent(session.id)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${(remoteBind || req.secure) ? '; Secure' : ''}`)
   }
   app.post('/api/signup', async (req, res) => {
-    const ip = req.ip || req.socket.remoteAddress || 'unknown'
-    if (!allowRate(ip, 'signup', 5, 60 * 60 * 1000)) return res.status(429).json({ error: 'Too many account requests. Please try again later.' })
     if (!sameOrigin(req)) return res.status(403).json({ error: 'Please refresh the page and try again.' })
     const fullName = typeof req.body?.fullName === 'string' ? req.body.fullName.trim().replace(/\s+/g, ' ') : ''
     const email = req.body?.email
@@ -609,7 +607,13 @@ function startDashboard() {
   })
 
   app.use(auth)
-  app.use('/api', (req, res, next) => allowRate(req.ip || 'unknown', 'api', 300, 60 * 1000) ? next() : res.status(429).json({ error: 'Too many requests. Wait a moment and try again.' }))
+  app.use('/api', (req, res, next) => {
+    // Connecting an account has no timed attempt quota. The manager coalesces
+    // concurrent requests and reuses the existing account/socket instead.
+    if (req.method === 'POST' && (req.path === '/accounts' || /^\/accounts\/[^/]+\/reconnect$/.test(req.path))) return next()
+    // Independent dashboard sessions do not consume a shared network/IP quota.
+    return allowRate(req.dashboardSession.tokenHash, 'api', 300, 60 * 1000) ? next() : res.status(429).json({ error: 'Too many requests. Wait a moment and try again.' })
+  })
   app.use('/api/accounts/:id', async (req, res, next) => {
     try {
       if (!await ownsAccount(req.params.id, req.workspace.id)) return res.status(404).json({ error: 'WhatsApp account not found in this business workspace.' })
@@ -691,7 +695,6 @@ function startDashboard() {
   })
   app.post('/api/accounts', async (req, res) => {
     try {
-      if (!allowRate(req.ip || 'unknown', 'create-account', 3, 15 * 60 * 1000)) return res.status(429).json({ error: 'Too many account creation requests. Try again later.' })
       const phone = String(req.body?.phone || '').trim()
       if (!/^[+()\d\s.-]+$/.test(phone)) return res.status(400).json({ error: 'Enter a valid phone number with country code.' })
       const result = await createAccount({ userId: req.user.id, workspaceId: req.workspace.id, name: req.body?.name, phone })
@@ -700,7 +703,6 @@ function startDashboard() {
   })
   app.post('/api/accounts/:id/reconnect', async (req, res) => {
     try {
-      if (!allowRate(req.ip || 'unknown', `reconnect:${req.params.id}`, 6, 15 * 60 * 1000)) return res.status(429).json({ error: 'Too many reconnect attempts for this account. Try again later.' })
       res.json(await reconnectAccount(req.params.id, { pair: !!req.body?.pair }))
     }
     catch (e) { log('Could not reconnect WhatsApp account:', e?.message || 'unknown error'); res.status(400).json({ error: 'Could not reconnect this WhatsApp account. Try again.' }) }
@@ -976,7 +978,7 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 <header><b>Business WhatsApp</b><select id="workspaceSelect" aria-label="Business workspace" onchange="switchWorkspace(this.value)"></select><span id="topStatus" class="pill">Loading</span><span id="syncState" class="muted" role="status" aria-live="polite">Checking server</span><select id="accountSelect" aria-label="WhatsApp account" onchange="selectAccount(this.value)"></select><button class="secondary" onclick="logout()">Logout</button></header>
 <main><nav class="nav"><button data-view="overview" onclick="showView('overview')">Overview</button><button data-view="accounts" onclick="showView('accounts')">Accounts</button><button data-view="messages" onclick="showView('messages')">Messages</button><button data-view="groups" onclick="showView('groups')">Recipients &amp; Groups</button><button data-view="jobs" onclick="showView('jobs')">Automations</button><button data-view="settings" onclick="showView('settings')">Settings</button></nav>
 <section id="overview" class="view"><h1>Dashboard</h1><div class="grid"><div class="card"><small>WhatsApp accounts</small><div class="stat" id="accountCount">0</div><button onclick="showView('accounts')">Manage accounts</button></div><div class="card"><small>Active jobs</small><div class="stat" id="activeCount">0</div><button onclick="showView('jobs')">View automations</button></div><div class="card"><small>Scheduled jobs</small><div class="stat" id="scheduledCount">0</div><button onclick="showView('jobs')">View schedule</button></div></div><div class="card"><h2>WhatsApp Accounts</h2><div id="overviewAccounts"></div><button onclick="showView('accounts')">＋ Connect WhatsApp</button></div><div class="card"><h2>Active Automations</h2><div id="overviewJobs"></div></div><div class="card"><h2>Recent Activity</h2><pre id="overviewLog"></pre></div><div class="card"><h2>Quick actions</h2><div class="actions"><button onclick="showView('accounts')">Connect WhatsApp</button><button onclick="newMessage();showView('messages')">Create Message</button><button onclick="showView('groups')">Manage Groups</button><button onclick="showView('jobs')">Create Automation</button></div></div></section>
-<section id="accounts" class="view"><h1>WhatsApp Accounts</h1><div class="card"><h2>＋ Connect WhatsApp</h2><div class="muted">Enter the phone number with country code. We’ll show a pairing code here.</div><div class="row"><input id="newAccountName" type="text" placeholder="Business or account name"><input id="newAccountPhone" type="tel" placeholder="+234 801 234 5678"><button onclick="connectAccount()">Connect WhatsApp</button></div><div id="pairCode"></div></div><div id="accountCards" class="grid"></div></section>
+<section id="accounts" class="view"><h1>WhatsApp Accounts</h1><div class="card"><h2>＋ Connect WhatsApp</h2><div class="muted">Enter the phone number with country code. We’ll show a pairing code here.</div><div class="row"><input id="newAccountName" type="text" placeholder="Business or account name"><input id="newAccountPhone" type="tel" placeholder="+234 801 234 5678"><button id="connectAccountButton" onclick="connectAccount()">Connect WhatsApp</button></div><p id="accountFeedback" class="form-feedback" role="status" aria-live="polite"></p><div id="pairCode"></div></div><div id="accountCards" class="grid"></div></section>
 <section id="messages" class="view"><h1>Messages</h1><div class="card"><h2 id="messageFormTitle">Create message</h2><input id="messageName" type="text" placeholder="Message name"><textarea id="messageText" placeholder="Message text. Separate rotating versions with a line containing ---"></textarea><div class="row"><input id="messageFile" type="file" accept="image/*,video/mp4,video/quicktime"><button class="secondary" onclick="uploadMessageMedia()">Upload media</button><span id="mediaLabel" class="muted"></span></div><div class="actions"><button onclick="saveMessage()">Save message</button><button class="secondary" onclick="previewMessage()">Preview</button><button class="secondary" onclick="newMessage()">Clear</button></div></div><div id="messageCards" class="grid"></div></section>
 <section id="groups" class="view"><h1>Recipients &amp; Groups</h1><div class="card"><h2>Individual numbers</h2><div class="row"><input id="recipientName" type="text" placeholder="Contact name (optional)"><input id="recipientPhone" type="tel" placeholder="Number with country code"><button onclick="addRecipient()">Add number</button></div><div id="recipientCards"></div></div><div class="card"><h2>Group Lists</h2><p class="help">Create a draft list, tick the groups you want, and click Save selected groups.</p><div class="row"><input id="newListName" type="text" placeholder="New group list name"><button onclick="addList()">Create Group List</button><button class="secondary" onclick="loadGroups()">Refresh WhatsApp groups</button></div><div id="listCards"></div></div></section>
 <section id="jobs" class="view">
@@ -1053,7 +1055,18 @@ function refresh(){var draft={name:document.getElementById('newAccountName')?.va
 function render(){if(!S)return;var acc=selectedAccount(),sel=document.getElementById('accountSelect');sel.innerHTML=(S.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'" '+(a.id===accountId?'selected':'')+'>'+esc(a.name)+' · '+esc(a.phone)+'</option>'}).join('')||'<option value="">No accounts</option>';document.getElementById('topStatus').textContent=acc?acc.status.replace('_',' '):'No WhatsApp account';document.getElementById('accountCount').textContent=(S.accounts||[]).length;document.getElementById('activeCount').textContent=(S.jobs||[]).filter(function(j){return j.status==='running'}).length;document.getElementById('scheduledCount').textContent=(S.jobs||[]).filter(function(j){return j.status==='scheduled'}).length;renderOverview();renderAccounts();renderMessages();renderGroups();renderJobs();renderSettings();showView(activeView)}
 function statusPill(status){return '<span class="pill '+esc(status)+'">'+esc(String(status||'unknown').replace('_',' '))+'</span>'}
 function renderOverview(){document.getElementById('overviewAccounts').innerHTML=(S.accounts||[]).map(function(a){return '<div class="row"><b class="grow">'+esc(a.name)+'</b>'+esc(a.phone)+' '+statusPill(a.status)+' <button class="secondary" onclick="selectAccount(\''+esc(a.id)+'\').then(function(){showView(\'accounts\')})">Manage</button></div>'}).join('')||'<p class="muted">Connect a WhatsApp account to get started.</p>';document.getElementById('overviewJobs').innerHTML=(S.jobs||[]).slice(0,8).map(function(j){return '<div class="row"><b class="grow">'+esc(j.name)+'</b><span>'+esc(j.accountName)+'</span>'+statusPill(j.status)+'</div>'}).join('')||'<p class="muted">No automation jobs yet.</p>';api('/api/log').then(function(x){document.getElementById('overviewLog').textContent=x.log||'No recent activity.'}).catch(function(){})}
-function connectAccount(){var name=document.getElementById('newAccountName').value,phone=document.getElementById('newAccountPhone').value;if(!/^[+()\d\s.-]+$/.test(phone)){toast('Enter a valid WhatsApp phone number.',true);return}api('/api/accounts','POST',{name:name,phone:phone}).then(function(d){accountId=d.account.id;pairAccountId=accountId;pairCode=d.pairingCode||'';return loadState()}).then(function(){toast(pairCode?'Pairing code generated.':'Connection starting.')}).catch(function(e){toast(e.message,true);refresh()})}
+function accountFeedback(message,bad){var el=document.getElementById('accountFeedback');el.textContent=message;el.className='form-feedback'+(bad?' err':'');}
+function connectAccount(){
+  var button=document.getElementById('connectAccountButton');if(button.disabled)return;
+  var name=document.getElementById('newAccountName').value.trim(),phone=document.getElementById('newAccountPhone').value.trim(),digits=phone.replace(/\D/g,'');
+  if(!/^[+()\d\s.-]+$/.test(phone)||digits.length<8||digits.length>15){accountFeedback('Enter your WhatsApp number with its country code (8 to 15 digits).',true);document.getElementById('newAccountPhone').focus();return;}
+  button.disabled=true;button.textContent='Connecting?';accountFeedback('Preparing your WhatsApp connection?');
+  return api('/api/accounts','POST',{name:name,phone:phone}).then(async function(d){
+    accountId=d.account.id;pairAccountId=accountId;pairCode=d.pairingCode||'';
+    await loadState();
+    accountFeedback(pairCode?'Pairing code ready. Open WhatsApp ? Linked Devices ? Link with phone number and enter the code.':d.account.status==='connected'?'WhatsApp is already connected. Your existing account is ready to use.':'Connecting your saved account. The status updates automatically.');
+  }).catch(async function(e){accountFeedback(e.message,true);try{await refresh()}catch{}}).finally(function(){button.disabled=false;button.textContent='Connect WhatsApp';});
+}
 function pairAgain(id){accountId=id;api('/api/accounts/'+encodeURIComponent(id)+'/reconnect','POST',{pair:true}).then(function(d){pairCode=d.pairingCode||'';pairAccountId=id;return loadState()}).then(function(){toast(pairCode?'Pairing code generated.':'Reconnecting.')}).catch(function(e){toast(e.message,true)})}
 function accountAction(id,action){if(action==='disconnect'&&!confirm('Disconnect this WhatsApp account for everyone in this business?'))return;return api('/api/accounts/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(d){toast(action==='disconnect'?'Account disconnected.':d.reused?'This account is already connected.':'Reconnection started.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function removeAccount(id){if(!confirm('Remove this account and its session data?'))return;api('/api/accounts/'+encodeURIComponent(id),'DELETE').then(function(){if(accountId===id)accountId='';pairCode='';toast('Account removed.');return loadState()}).catch(function(e){toast(e.message,true)})}

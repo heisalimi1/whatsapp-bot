@@ -140,6 +140,13 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     body: JSON.stringify({ fullName: 'Weak User', email: 'weak@example.test', password: 'short', confirmPassword: 'short' })
   })
   assert.equal(response.status, 400, 'signup enforces password requirements')
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const retry = await fetch(`${base}/api/signup`, {
+      method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+      body: JSON.stringify({ fullName: 'Workspace Owner', email: emailA, password: passwordA, confirmPassword: passwordA })
+    })
+    assert.equal(retry.status, 409, 'repeated signup attempts report the actual duplicate email instead of a timed lockout')
+  }
   const restoreDeadline = Date.now() + 5000
   let initialHealth
   while (Date.now() < restoreDeadline) {
@@ -196,6 +203,14 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   await putAccount(accountIds[0], 'A')
   await putAccount(accountIds[1], 'B')
   const messageHeaders = { ...proxyHeaders, origin: 'https://127.0.0.1:' + port, 'x-csrf-token': csrfToken, 'content-type': 'application/json' }
+  for (let attempt = 0; attempt < 310; attempt++) {
+    const invalid = await fetch(base + '/api/accounts', { method: 'POST', headers: messageHeaders, body: JSON.stringify({ phone: 'invalid-fixture' }) })
+    assert.equal(invalid.status, 400, 'connection attempts have no account creation or blanket API cooldown')
+  }
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const reconnect = await fetch(base + '/api/accounts/' + accountIds[0] + '/reconnect', { method: 'POST', headers: messageHeaders, body: JSON.stringify({ pair: false }) })
+    assert.equal(reconnect.status, 400, 'a fixture needing pairing reports its authentication state without a reconnect lockout')
+  }
   let messageResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/messages', {
     method: 'POST', headers: messageHeaders,
     body: JSON.stringify({ name: 'Saved from Messages page', texts: ['Saved text for automation'], media: '' })

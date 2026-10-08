@@ -83,3 +83,11 @@ node scripts/recover-missing-sessions.js --root /home/ec2-user/whatsapp-bot --ba
 - The installed Baileys release remains `7.0.0-rc14`; pairing APIs are retained. This task does not upgrade the SDK or change its protocol. Official lifecycle guidance: https://github.com/WhiskeySockets/docs/blob/main/advanced/troubleshooting.mdx
 - A first successful server group fetch is needed to create an initial snapshot for existing accounts. Later restarts preserve that snapshot even while disconnected.
 - Configuration revisions protect the updated dashboard against stale full-form writes. Compatibility callers that omit a revision retain the prior API behavior.
+
+## Account creation experience followup
+
+Removed the timed signup, WhatsApp account creation and reconnect quotas. Connection actions also bypass the blanket API attempt quota, while other API requests use independent authenticated-session buckets instead of sharing an IP bucket. Repeating Connect WhatsApp for the same number in an authorized business selects and reconnects its existing account, without adding another record or socket. Cross-business authorization and duplicate isolation remain enforced.
+
+The Connect WhatsApp form now validates the country-code number before submitting, shows inline progress and pairing instructions, and disables the button only while the request is pending. Repeated clicks send a single request; the button immediately becomes available again after success or failure.
+
+Regression coverage includes eight repeated signup retries followed by successful signup, 310 account connection requests without a cooldown, twelve reconnect retries without a cooldown, twenty concurrent repeated connection submissions reusing one account/socket, and a real Chromium double-click/progress check. Password-reset and unrelated upload protections remain in place.
