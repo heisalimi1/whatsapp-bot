@@ -7,6 +7,7 @@ import net from 'node:net'
 import vm from 'node:vm'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { checkDashboardBrowser } from '../test-support/dashboard-browser.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const accountIds = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222']
@@ -181,7 +182,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     const data = {
       timezone: 'Africa/Lagos', delaySeconds: [0, 0], statusRecipients: [],
       recipients: label === 'A' ? [{ id: recipientId, name: 'Recipient A', phone: '2348012345678' }] : [],
-      groupLists: { [`${label} list`]: [] },
+      groupLists: { [`${label} list`]: ['test-group@g.us'] },
       messages: [{ id: messageId, name: label, texts: [`private ${label}`], media: '' }], jobs: []
     }
     const result = await fetch(`${base}/api/accounts/${id}/data`, {
@@ -222,8 +223,10 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const saveButtonMatch = dashboardMarkup.match(/<button onclick="([^"]+)">Save message<\/button>/)
   assert.equal(saveButtonMatch?.[1], 'saveMessage()', 'the Messages page button calls the save handler')
   const browserElements = new Map()
+  const selectedBrowserLists = [{ value: 'A list', checked: true }]
+  const selectedBrowserContacts = [{ value: recipientId, checked: true }]
   const browserElement = id => {
-    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, classList: { toggle() {} } })
+    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, checked: false, classList: { toggle() {} } })
     return browserElements.get(id)
   }
   const saveButton = { disabled: false }
@@ -239,7 +242,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     document: {
       getElementById: browserElement,
       querySelector: () => saveButton,
-      querySelectorAll: () => [],
+      querySelectorAll: selector => selector === '.jobList:checked' ? selectedBrowserLists.filter(item => item.checked) : selector === '.jobRecipient:checked' ? selectedBrowserContacts.filter(item => item.checked) : selector === '.jobList,.jobRecipient' ? [...selectedBrowserLists, ...selectedBrowserContacts] : [],
       addEventListener() {},
       activeElement: { tagName: 'BODY' },
       hidden: false
@@ -293,6 +296,73 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.match(dashboardMarkup, /messageSelect\.innerHTML=\(S\.cfg\.messages\|\|\[\]\)\.map/, 'Automations renders saved account messages as selectable options')
   assert(dashboardMarkup.includes("var target='/api/accounts/'+encodeURIComponent(accountId)+'/messages'"), 'Save Message uses the account-scoped message API')
 
+  // Exercise the served creation handler against real authenticated HTTP routes.
+  const missingAudience = await fetch(base + '/api/accounts/' + accountIds[0] + '/jobs', {
+    method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ name: 'Missing viewers', messageId, toStatus: true, repeatCount: 1, delaySeconds: [0, 0], scheduleAt: future })
+  })
+  assert.equal(missingAudience.status, 400)
+  assert.match((await missingAudience.json()).error, /Add status viewers/)
+  browserContext.S.cfg.statusRecipients = ['12345678901']
+  await vm.runInContext("saveData()", browserContext)
+  browserElement('jobMessage').value = testingMessage.id
+  browserElement('jobRepeat').value = '1'
+  browserElement('jobMinDelay').value = '0'
+  browserElement('jobMaxDelay').value = '0'
+  browserElement('jobMode').value = 'at'
+  browserElement('jobDate').value = future
+  const destinationJobIds = []
+  for (const [label, groups, status, contacts] of [
+    ['Groups only', true, false, false],
+    ['Status only', false, true, false],
+    ['Groups and Status', true, true, false],
+    ['Contacts only', false, false, true]
+  ]) {
+    browserElement('jobSendGroups').checked = groups
+    browserElement('jobToStatus').checked = status
+    browserElement('jobSendContacts').checked = contacts
+    browserElement('jobName').value = label
+    vm.runInContext('destinationMode()', browserContext)
+    assert.equal(browserElement('jobSendGroups').checked, groups, 'Status selection leaves Groups independent')
+    assert.equal(browserElement('jobToStatus').checked, status, 'Groups selection leaves Status independent')
+    await vm.runInContext('createJob()', browserContext)
+    assert.equal(browserElement('jobFeedback').textContent, 'Automation scheduled successfully.', label + ' shows success')
+    const saved = browserContext.S.cfg.jobs.find(job => job.name === label)
+    assert.ok(saved, label + ' appears after the server/UI refresh')
+    assert.equal(saved.toStatus, status)
+    assert.deepEqual(Array.from(saved.toLists), groups ? ['A list'] : [], 'unselected group destinations are omitted even when their list remains checked')
+    assert.deepEqual(Array.from(saved.toRecipients), contacts ? [recipientId] : [])
+    destinationJobIds.push(saved.id)
+  }
+  const savedDestinations = JSON.parse(fs.readFileSync(path.join(accountRoot, accountIds[0], 'automation.json'), 'utf8')).jobs
+  assert(savedDestinations.some(job => job.name === 'Status only' && job.toStatus && !job.toLists.length && !job.toRecipients.length), 'Status-only choice persists to disk')
+  assert(savedDestinations.some(job => job.name === 'Groups and Status' && job.toStatus && job.toLists.includes('A list')), 'combined destinations persist to disk')
+  assert.match(browserElement('jobCards').innerHTML, /WhatsApp Status/, 'automation cards clearly show Status')
+  browserElement('jobSendGroups').checked = false
+  browserElement('jobToStatus').checked = false
+  browserElement('jobSendContacts').checked = false
+  const requestsBeforeValidation = browserRequests.length
+  await vm.runInContext('createJob()', browserContext)
+  assert.match(browserElement('jobFeedback').textContent, /Choose Groups/)
+  assert.equal(browserRequests.length, requestsBeforeValidation, 'empty destination form gives feedback without a request')
+  browserElement('jobSendGroups').checked = true
+  browserElement('jobToStatus').checked = true
+  selectedBrowserLists[0].checked = false
+  await vm.runInContext('createJob()', browserContext)
+  assert.match(browserElement('jobFeedback').textContent, /Choose at least one group list/)
+  assert.equal(browserRequests.length, requestsBeforeValidation)
+  selectedBrowserLists[0].checked = true
+  const invalidDestination = await fetch(base + '/api/accounts/' + accountIds[0] + '/jobs', {
+    method: 'POST', headers: messageHeaders,
+    body: JSON.stringify({ name: 'Invalid list', messageId, toLists: ['missing'], toStatus: true, repeatCount: 1, delaySeconds: [0, 0], scheduleAt: future })
+  })
+  assert.equal(invalidDestination.status, 400, 'the API validates selected groups even with Status enabled')
+  assert.equal(browserConsoleErrors.length, 0)
+  const checkedBrowser = await checkDashboardBrowser({
+    base, cookie: cookiePair, accountId: accountIds[0], messageId: testingMessage.id,
+    screenshotDir: process.env.DASHBOARD_TEST_SCREENSHOTS
+  })
+  t.diagnostic(checkedBrowser ? 'Real Chromium: separate/combined destinations, refresh, desktop/mobile layouts and console passed.' : 'Real Chromium unavailable; HTTP and dashboard handler coverage passed.')
   const mediaUpload = await fetch(base + '/api/upload', {
     method: 'POST', headers: messageHeaders,
     body: JSON.stringify({ accountId: accountIds[0], name: 'message-test.png', data: 'iVBORw0KGgo=' })
@@ -404,6 +474,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal(restartedA.cfg.jobs.find(job => job.id === lifecycleJobId).status, 'cancelled')
   assert.equal(restartedB.cfg.jobs[0].status, 'scheduled')
   assert.equal(restartedB.cfg.jobs[0].scheduleAt, future)
+  for (const id of destinationJobIds) assert(restartedA.cfg.jobs.some(job => job.id === id), 'independent destination automations survive restart')
   await stop(app.child)
   assert.equal(app.output.includes(passwordA), false, 'password is never written to process logs')
 })

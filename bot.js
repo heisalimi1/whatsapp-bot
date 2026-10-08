@@ -6,6 +6,7 @@ import fs from 'fs'
 import path from 'path'
 import { listAccounts, getAccountSocket, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected } from './whatsapp-manager.js'
 import { loadAutomation, saveAutomation, makeId } from './automation-store.js'
+import { normalizeDestinations, buildDeliveryPlan, sendDelivery } from './automation-delivery.js'
 import { allowRate, tokensMatch } from './dashboard-security.js'
 import { cleanupExpiredAuthRecords, closeAuthStore, consumePasswordReset, createPasswordReset, createSession, createUser, destroySession, findUser, normalizeEmail, sessionForRequest, verifyUserPassword } from './auth-store.js'
 import { sendPasswordResetEmail } from './password-reset-mailer.js'
@@ -285,46 +286,42 @@ async function executeJob(accountId, jobId, { oneShot = false, resumeProgress = 
   if (!sock) { job.status = oneShot ? 'failed' : 'scheduled'; job.lastError = 'WhatsApp account is not connected.'; saveAccountData(accountId, data); return }
   const message = data.messages.find(m => m.id === job.messageId) || { texts: job.texts || [job.text || ''], media: job.media || '' }
   const targets = await targetsFor(accountId, data, job)
-  if (!targets.length) { job.status = 'failed'; job.lastError = 'Choose at least one group or individual recipient.'; saveAccountData(accountId, data); return }
+
   const rawRepeat = Number(job.repeatCount)
   const repeat = Number.isInteger(rawRepeat) && rawRepeat >= 1 && rawRepeat <= 100 ? rawRepeat : 0
   const delays = Array.isArray(job.delaySeconds) ? job.delaySeconds : data.delaySeconds
   if (!repeat || !Array.isArray(delays) || delays.length !== 2 || delays.some(n => !Number.isFinite(Number(n))) || Number(delays[0]) < 0 || Number(delays[1]) < Number(delays[0]) || Number(delays[1]) > 600) {
     job.status = 'failed'; job.lastError = 'Job repeat count or delivery delay is invalid.'; saveAccountData(accountId, data); return
   }
-  if (targets.length * repeat > 10000) { job.status = 'failed'; job.lastError = 'This job exceeds the 10,000 delivery safety limit.'; saveAccountData(accountId, data); return }
+  let deliveries
+  try { deliveries = buildDeliveryPlan(targets, data.statusRecipients || [], job, repeat) }
+  catch (e) { job.status = 'failed'; job.lastError = e.message; saveAccountData(accountId, data); return }
   const [minD, maxD] = delays.map(Number)
-  const previousProgress = Math.max(0, Math.min(job.progress || 0, targets.length * repeat))
-  job.status = 'running'; job.startedAt = new Date().toISOString(); job.progress = resumeProgress ? previousProgress : 0; job.total = targets.length * repeat
+  const previousProgress = Math.max(0, Math.min(job.progress || 0, deliveries.length))
+  job.status = 'running'; job.startedAt = new Date().toISOString(); job.progress = resumeProgress ? previousProgress : 0; job.total = deliveries.length
   if (!resumeProgress) job.failedCount = 0
   job.lastError = ''
   saveAccountData(accountId, data)
   log(`Job ${job.id} started for account ${accountId}; ${job.total} deliveries queued`)
   try {
-    let deliveryIndex = 0
-    for (let r = 0; r < repeat; r++) {
-      for (const target of targets) {
-        if (deliveryIndex++ < (resumeProgress ? previousProgress : 0)) continue
-        const current = await dataFor(accountId)
-        const liveJob = current.jobs.find(j => j.id === jobId)
-        if (!liveJob || stopRequests.has(key) || liveJob.status === 'paused' || liveJob.status === 'cancelled') break
-        const text = pickText(message, key)
-        const content = buildContent({ media: message.media }, text, accountId)
-        if (!content) throw new Error(`Media file for "${message.name || job.name}" is missing.`)
-        try { await sock.sendMessage(target.jid, content); log(`Job ${job.id} sent one delivery for account ${accountId}`) }
-        catch (e) { log(`Job ${job.id} delivery failed for account ${accountId}:`, e.message); job.failedCount = (job.failedCount || 0) + 1; job.lastError = 'One or more recipients could not be reached.' }
-        job.progress++
-        saveAccountData(accountId, data)
-        if (job.progress < job.total && maxD > 0) await waitBetweenSends(key, (minD + Math.random() * (maxD - minD)) * 1000)
+    for (let index = 0; index < deliveries.length; index++) {
+      if (index < (resumeProgress ? previousProgress : 0)) continue
+      const current = await dataFor(accountId)
+      const liveJob = current.jobs.find(j => j.id === jobId)
+      if (!liveJob || stopRequests.has(key) || liveJob.status === 'paused' || liveJob.status === 'cancelled') break
+      const delivery = deliveries[index]
+      const content = buildContent({ media: message.media }, pickText(message, key), accountId)
+      try {
+        await sendDelivery(sock, delivery, content)
+        log('Job', job.id, 'sent one', delivery.kind, 'delivery for account', accountId)
+      } catch (e) {
+        job.failedCount = (job.failedCount || 0) + 1
+        job.lastError = delivery.kind === 'status' ? 'Status post failed.' : 'One or more recipients could not be reached.'
+        log('Delivery failed for job', job.id, e.message)
       }
-      if (stopRequests.has(key)) break
-    }
-    if (job.toStatus && !stopRequests.has(key)) {
-      const jids = (data.statusRecipients || []).map(n => String(n).includes('@') ? n : `${n}@s.whatsapp.net`)
-      if (jids.length) {
-        try { const content = buildContent({ media: message.media }, pickText(message, key), accountId); if (content) await sock.sendMessage('status@broadcast', content, { statusJidList: jids }) }
-        catch (e) { job.failedCount++; job.lastError = 'Status post failed.'; log(`Status delivery failed for job ${job.id}:`, e.message) }
-      }
+      job.progress++
+      saveAccountData(accountId, data)
+      if (job.progress < job.total && maxD > 0) await waitBetweenSends(key, (minD + Math.random() * (maxD - minD)) * 1000)
     }
     if (job.status === 'paused' || job.status === 'cancelled') return
     job.completedAt = new Date().toISOString()
@@ -798,7 +795,8 @@ function startDashboard() {
       if (data.jobs.length >= MAX_JOBS_PER_ACCOUNT) return res.status(409).json({ error: `This account has reached its ${MAX_JOBS_PER_ACCOUNT}-job storage limit. Remove old jobs before adding more.` })
       if (!String(body.name || '').trim()) return res.status(400).json({ error: 'Enter a job name.' })
       if (!data.messages.some(m => m.id === body.messageId)) return res.status(400).json({ error: 'Choose a saved message.' })
-      if (!(body.toLists || []).length && !(body.toRecipients || []).length) return res.status(400).json({ error: 'Choose at least one recipient or group list.' })
+      const destination = normalizeDestinations(data, body)
+      if (destination.error) return res.status(400).json({ error: destination.error })
       const repeatCount = Number(body.repeatCount)
       const delaySeconds = Array.isArray(body.delaySeconds) ? body.delaySeconds.map(Number) : data.delaySeconds
       if (!Number.isInteger(repeatCount) || repeatCount < 1 || repeatCount > 100) return res.status(400).json({ error: 'Repeat count must be between 1 and 100.' })
@@ -807,8 +805,8 @@ function startDashboard() {
       const scheduleAt = body.scheduleAt ? new Date(body.scheduleAt) : null
       if (scheduleAt && (!Number.isFinite(scheduleAt.getTime()) || scheduleAt.getTime() <= Date.now())) return res.status(400).json({ error: 'Choose a future schedule time.' })
       if (!scheduleAt && !body.cron && !await getAccountSocket(req.params.id)) return res.status(409).json({ error: 'Connect this WhatsApp account before starting an automation now.' })
-      const job = { id: makeId(), name: String(body.name).trim().slice(0, 100), messageId: body.messageId, toLists: (body.toLists || []).filter(n => n in data.groupLists), toRecipients: (body.toRecipients || []).filter(id => data.recipients.some(r => r.id === id)), repeatCount, delaySeconds, cron: body.cron || '', scheduleAt: scheduleAt?.toISOString() || '', status: 'scheduled', progress: 0, total: 0, createdAt: new Date().toISOString(), scheduledAt: scheduleAt?.toISOString() || body.cron || 'Now', completedAt: '' }
-      if (!job.toLists.length && !job.toRecipients.length) return res.status(400).json({ error: 'Choose valid recipients.' })
+      const job = { id: makeId(), name: String(body.name).trim().slice(0, 100), messageId: body.messageId, ...destination.value, repeatCount, delaySeconds, cron: body.cron || '', scheduleAt: scheduleAt?.toISOString() || '', status: 'scheduled', progress: 0, total: 0, createdAt: new Date().toISOString(), scheduledAt: scheduleAt?.toISOString() || body.cron || 'Now', completedAt: '' }
+
       data.jobs.push(job); saveAccountData(req.params.id, data); scheduleAccount(req.params.id, data)
       if (!scheduleAt && !job.cron) runJob(req.params.id, job.id, { oneShot: true }).catch(e => log('Job failed:', e.message))
       res.status(201).json({ ok: true, job, message: scheduleAt || job.cron ? 'Automation scheduled successfully.' : 'Automation started successfully.' })
@@ -881,6 +879,18 @@ function startDashboard() {
 const STAGE3_PAGE = String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Business WhatsApp</title>
 <style>
 :root{--green:#087f6e;--ink:#172522;--muted:#667570;--line:#e1e9e6;--bg:#f4f7f6;--card:#fff}*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,Segoe UI,sans-serif;color:var(--ink);background:var(--bg)}header{position:sticky;top:0;z-index:5;background:#fff;border-bottom:1px solid var(--line);padding:12px max(16px,calc((100vw - 1180px)/2));display:flex;align-items:center;gap:14px;box-shadow:0 2px 10px #1725220a}header b{font-size:18px}header select{margin-left:auto;max-width:230px}main{max-width:1180px;margin:auto;padding:20px}.nav{display:flex;gap:8px;overflow:auto;padding:4px 0 14px}.nav button{background:#e5eeeb;color:#23443d;white-space:nowrap}.nav button.sel{background:var(--green);color:#fff}.view{display:none}.view.sel{display:block}h1{font-size:25px;margin:8px 0 16px}h2{font-size:18px;margin:18px 0 10px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;box-shadow:0 2px 8px #17252208;margin:10px 0}.card h3{margin:0 0 8px;font-size:16px}.row{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:8px 0}.row>*{min-width:0}.grow{flex:1}input,select,textarea{font:inherit;padding:9px 10px;border:1px solid #cbd8d3;border-radius:8px;background:#fff;color:var(--ink)}input[type=text],input[type=tel],input[type=number],input[type=datetime-local],select,textarea{width:100%}textarea{min-height:95px;resize:vertical}button{border:0;border-radius:8px;background:var(--green);color:white;font:inherit;font-weight:600;padding:9px 13px;cursor:pointer}button.secondary{background:#e7efec;color:#23443d}button.danger{background:#a93a36}button:disabled{opacity:.5;cursor:not-allowed}.muted,small{color:var(--muted)}.pill{display:inline-block;padding:3px 9px;border-radius:999px;background:#e8efed;color:#37564d;font-size:13px}.pill.connected,.pill.running,.pill.completed{background:#dcf5e7;color:#126039}.pill.failed,.pill.cancelled,.pill.logged_out{background:#fde4e2;color:#8a2522}.pill.scheduled{background:#e7efff;color:#294c97}.pill.paused,.pill.disconnected{background:#f0eee6;color:#625b38}.stat{font-size:28px;font-weight:700}.groupbox{max-height:260px;overflow:auto;border:1px solid var(--line);padding:8px;border-radius:8px}.groupbox label{display:block;padding:5px}.message-preview{white-space:pre-wrap;color:#42534d}.toast{position:fixed;right:16px;bottom:16px;z-index:10;padding:12px 16px;color:#fff;background:#245b48;border-radius:8px;box-shadow:0 4px 18px #0002;display:none}.toast.err{background:#a93a36}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px;border-bottom:1px solid var(--line)}.wrap{overflow:auto}.actions{display:flex;gap:6px;flex-wrap:wrap}.hidden{display:none!important}@media(max-width:600px){main{padding:13px}header{padding:10px 13px;gap:8px}header select{max-width:48%}.row>*{flex:1}.row button{flex:0 0 auto}.stat{font-size:23px}td,th{padding:7px;font-size:13px}}
+/* Dashboard workspace and independent delivery destinations. */
+body{background:radial-gradient(ellipse at top right,#e5f3ed 0,transparent 45%),#f5f7fa}
+header{background:#ffffffed;backdrop-filter:blur(14px)}header b{letter-spacing:-.5px}
+main{padding-top:26px}.nav{gap:6px;margin-bottom:10px}.nav button{background:transparent;color:var(--muted);border-radius:10px}.nav button.sel{background:#e0f1eb;color:#076c59}
+.card{padding:22px;border-radius:16px;box-shadow:0 4px 18px #17252205}h1{letter-spacing:-.8px;font-size:30px}h2{letter-spacing:-.3px}
+button{transition:background .15s,box-shadow .15s}button:hover:not(:disabled){filter:brightness(.96)}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #96d6c5;outline-offset:3px}
+input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrink:0}label{line-height:1.6}label>input:not([type=checkbox]),label>select{display:block;margin-top:5px}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.page-heading{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:20px}.page-heading h1{margin:0 0 4px}.page-heading p{margin:0}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:1.5px;color:var(--green);font-weight:700}
+.automation-layout{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(260px,1fr);gap:20px;align-items:start}.automation-layout>.card{margin:0}.automation-layout>*,.field-grid>*{min-width:0}.form-step{padding:0 0 24px;margin-bottom:24px;border-bottom:1px solid var(--line)}.form-step h2{margin:0 0 6px}.step-number{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:8px;background:#e4f2ed;color:var(--green);font-size:13px;margin-right:8px}.help{font-size:13px;margin:0 0 16px;color:var(--muted)}
+.destination-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.destination-choice{display:flex;align-items:flex-start;gap:12px;border:1px solid var(--line);padding:16px;border-radius:12px;cursor:pointer;background:#fafcfb}.destination-choice.selected{border-color:var(--green);background:#eff9f4;box-shadow:0 0 0 1px var(--green)}.destination-choice input{margin-top:4px}.destination-choice strong,.destination-choice small{display:block}.destination-panel{padding:14px 0 0}.target-options{display:flex;flex-direction:column;gap:8px;max-height:240px;overflow:auto}.target-option{display:flex;align-items:center;gap:9px;border:1px solid var(--line);border-radius:9px;padding:9px 12px}.target-option small{margin-left:auto}.status-help{border-radius:10px;background:#eef4ff;padding:14px;margin:0}.status-help button{margin-top:10px}
+.contacts-option{display:flex;align-items:center;gap:9px;margin-top:18px}.preview-panel{position:sticky;top:88px}.preview-panel h2{margin-top:0}.preview-text{white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#f4f8f6;border-radius:10px;max-height:250px;overflow:auto;font-size:14px}.summary-line{display:flex;justify-content:space-between;gap:12px;margin:16px 0;font-size:14px}.summary-line span{color:var(--muted)}.summary-line strong{text-align:right}.submit-row{display:flex;justify-content:space-between;align-items:center;gap:12px}.submit-row button{padding:12px 20px}.form-feedback{margin-top:12px;font-size:14px;color:var(--green)}.form-feedback.err{color:#a93a36}.advanced{margin-top:16px}.advanced summary{cursor:pointer;color:var(--muted);font-size:14px}.advanced .field-grid{margin-top:12px}.job-destinations{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.empty-state{padding:24px;text-align:center;border:1px dashed #cadbd3;border-radius:12px;color:var(--muted)}
+@media(max-width:850px){.automation-layout{grid-template-columns:1fr}.preview-panel{position:static}}@media(max-width:600px){header{flex-wrap:wrap}header b{flex:1 1 220px;white-space:nowrap}header select{order:3;max-width:none;margin:0;flex:1 1 calc(100% - 100px)}header>button{order:4}.field-grid,.destination-grid{grid-template-columns:1fr}.card{padding:16px}.page-heading{align-items:flex-start}.submit-row{align-items:flex-start;flex-direction:column}.submit-row button{width:100%}h1{font-size:26px}}
 </style></head><body>
 <header><b>Business WhatsApp</b><span id="topStatus" class="pill">Loading</span><select id="accountSelect" onchange="selectAccount(this.value)"></select><button class="secondary" onclick="logout()">Logout</button></header>
 <main><nav class="nav"><button data-view="overview" onclick="showView('overview')">Overview</button><button data-view="accounts" onclick="showView('accounts')">Accounts</button><button data-view="messages" onclick="showView('messages')">Messages</button><button data-view="groups" onclick="showView('groups')">Recipients &amp; Groups</button><button data-view="jobs" onclick="showView('jobs')">Automations</button><button data-view="settings" onclick="showView('settings')">Settings</button></nav>
@@ -888,9 +898,34 @@ const STAGE3_PAGE = String.raw`<!doctype html><html lang="en"><head><meta charse
 <section id="accounts" class="view"><h1>WhatsApp Accounts</h1><div class="card"><h2>＋ Connect WhatsApp</h2><div class="muted">Enter the phone number with country code. We’ll show a pairing code here.</div><div class="row"><input id="newAccountName" type="text" placeholder="Business or account name"><input id="newAccountPhone" type="tel" placeholder="+234 801 234 5678"><button onclick="connectAccount()">Connect WhatsApp</button></div><div id="pairCode"></div></div><div id="accountCards" class="grid"></div></section>
 <section id="messages" class="view"><h1>Messages</h1><div class="card"><h2 id="messageFormTitle">Create message</h2><input id="messageName" type="text" placeholder="Message name"><textarea id="messageText" placeholder="Message text. Separate rotating versions with a line containing ---"></textarea><div class="row"><input id="messageFile" type="file" accept="image/*,video/mp4,video/quicktime"><button class="secondary" onclick="uploadMessageMedia()">Upload media</button><span id="mediaLabel" class="muted"></span></div><div class="actions"><button onclick="saveMessage()">Save message</button><button class="secondary" onclick="previewMessage()">Preview</button><button class="secondary" onclick="newMessage()">Clear</button></div></div><div id="messageCards" class="grid"></div></section>
 <section id="groups" class="view"><h1>Recipients &amp; Groups</h1><div class="card"><h2>Individual numbers</h2><div class="row"><input id="recipientName" type="text" placeholder="Contact name (optional)"><input id="recipientPhone" type="tel" placeholder="Number with country code"><button onclick="addRecipient()">Add number</button></div><div id="recipientCards"></div></div><div class="card"><h2>Group Lists</h2><div class="row"><input id="newListName" type="text" placeholder="New group list name"><button onclick="addList()">Create Group List</button><button class="secondary" onclick="loadGroups()">Refresh WhatsApp groups</button></div><div id="listCards"></div></div></section>
-<section id="jobs" class="view"><h1>Automations</h1><div class="card"><h2>Create Automation</h2><div class="row"><label class="grow">WhatsApp account<select id="jobAccount"></select></label><label class="grow">Job name<input id="jobName" type="text" placeholder="Weekend Promotion"></label></div><div class="row"><label class="grow">Message<select id="jobMessage"></select></label><label>Repeat count<input id="jobRepeat" type="number" min="1" max="100" value="1"></label></div><div class="row"><label>Minimum delay (seconds)<input id="jobMinDelay" type="number" min="0" max="600" value="5"></label><label>Maximum delay (seconds)<input id="jobMaxDelay" type="number" min="0" max="600" value="15"></label></div><div><b>Recipients / lists</b><div id="jobTargets" class="row"></div></div><div class="row"><label>Schedule<select id="jobMode" onchange="scheduleMode()"><option value="now">Now</option><option value="at">Schedule once</option><option value="cron">Recurring schedule</option></select></label><label id="dateWrap" class="hidden">Run at<input id="jobDate" type="datetime-local"></label><label id="cronWrap" class="hidden grow">Cron schedule<input id="jobCron" type="text" placeholder="0 9 * * *"></label><label><input id="jobToStatus" type="checkbox"> Also post to status</label></div><button onclick="createJob()">Create Job</button></div><div id="jobCards"></div></section>
-<section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum delay<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum delay<input id="defaultMax" type="number" min="0" max="600"></label></div><label>Status viewers, one phone number per line<textarea id="statusRecipients"></textarea></label><button onclick="saveSettings()">Save settings</button></div></section>
-</main><div id="toast" class="toast"></div>
+<section id="jobs" class="view">
+<div class="page-heading"><div><span class="eyebrow">Campaign workspace</span><h1>Automations</h1><p class="muted">Send the right message to the right place, on your schedule.</p></div></div>
+<div class="automation-layout"><div class="card">
+<div class="form-step"><h2><span class="step-number">1</span>Choose your message</h2><p class="help">Select a saved message, including any attached photo or video.</p>
+<div class="field-grid"><label>WhatsApp account<select id="jobAccount"></select></label><label>Automation name<input id="jobName" type="text" maxlength="100" placeholder="e.g. Weekend promotion"></label></div>
+<label>Saved message<select id="jobMessage" onchange="updateJobSummary()"></select></label></div>
+<div class="form-step"><h2><span class="step-number">2</span>Where should it go?</h2><p class="help">Choose Groups, WhatsApp Status, or select both to send to both places.</p>
+<div class="destination-grid">
+<label id="groupChoice" class="destination-choice selected"><input id="jobSendGroups" type="checkbox" checked onchange="destinationMode()"><span><strong>Send to groups</strong><small>Deliver to the group lists you choose.</small></span></label>
+<label id="statusChoice" class="destination-choice"><input id="jobToStatus" type="checkbox" onchange="destinationMode()"><span><strong>Post to WhatsApp Status</strong><small>Share a status update with your saved viewers.</small></span></label>
+</div>
+<div id="jobGroupPanel" class="destination-panel"><div id="jobTargets" class="target-options"></div><button class="secondary" onclick="showView('groups')">Manage group lists</button></div>
+<div id="jobStatusPanel" class="destination-panel hidden"><div class="status-help"><strong>Status audience</strong><p id="jobStatusAudience" class="help"></p><small>Status is posted once per run. Repeats apply to group and contact messages.</small><br><button class="secondary" onclick="showView('settings');document.getElementById('statusRecipients').focus()">Manage status viewers</button></div></div>
+<label class="contacts-option"><input id="jobSendContacts" type="checkbox" onchange="destinationMode()">Send to individual contacts</label>
+<div id="jobContactPanel" class="destination-panel hidden"><div id="jobContactTargets" class="target-options"></div><button class="secondary" onclick="showView('groups')">Manage contacts</button></div></div>
+<div class="form-step"><h2><span class="step-number">3</span>Choose when to send</h2><p id="jobTimezone" class="help"></p>
+<div class="field-grid"><label>Delivery schedule<select id="jobMode" onchange="scheduleMode()"><option value="now">Send now</option><option value="at">Schedule for later</option><option value="cron">Recurring schedule</option></select></label>
+<label id="dateWrap" class="hidden">Date and time<input id="jobDate" type="datetime-local"></label><label id="cronWrap" class="hidden">Cron expression<input id="jobCron" type="text" placeholder="0 9 * * *"><small>For example: 0 9 * * * runs daily at 9 AM.</small></label></div>
+<details class="advanced"><summary>Delivery settings: repeats and pacing</summary><div class="field-grid">
+<label>Group/contact repeats<input id="jobRepeat" type="number" min="1" max="100" value="1" onchange="updateJobSummary()"></label>
+<label>Minimum delay (seconds)<input id="jobMinDelay" type="number" min="0" max="600" value="5"></label>
+<label>Maximum delay (seconds)<input id="jobMaxDelay" type="number" min="0" max="600" value="15"></label></div><p class="help">A random delay between deliveries helps pace your campaign.</p></details></div>
+<div class="submit-row"><span class="muted">Review your campaign summary before sending.</span><button id="createJobButton" onclick="createJob()">Send now</button></div><div id="jobFeedback" class="form-feedback" role="status" aria-live="polite"></div>
+</div>
+<aside class="card preview-panel"><span class="eyebrow">Your campaign</span><h2>Ready to send?</h2><div id="jobPreview" class="preview-text">Choose a saved message to preview it here.</div><p id="jobMediaHint" class="help"></p><div class="summary-line"><span>Destinations</span><strong id="jobDestinationSummary">Choose a destination</strong></div><div class="summary-line"><span>Schedule</span><strong id="jobScheduleSummary">Send now</strong></div><div class="summary-line"><span>Account</span><strong id="jobConnectionSummary"></strong></div><small>Your messages and audience stay separate for each WhatsApp account.</small></aside>
+</div><div class="page-heading" style="margin-top:28px"><div><h2>Your automations</h2><p class="muted">Track deliveries and manage upcoming campaigns.</p></div></div><div id="jobCards"></div></section>
+<section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum delay<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum delay<input id="defaultMax" type="number" min="0" max="600"></label></div><h2>WhatsApp Status audience</h2><p class="help">Add viewers for the selected WhatsApp account, one number per line with country code. These viewers are used only for Status posts.</p><label>Status viewers<textarea id="statusRecipients" placeholder="One number per line with country code"></textarea></label><button onclick="saveSettings()">Save settings</button></div></section>
+</main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 var S=null, accountId='', activeView='overview', editMessageId='', mediaPath='', pairCode='', pairAccountId='', toastTimer=null, csrfToken='';
 function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
@@ -899,7 +934,7 @@ function logout(){api('/api/logout','POST',{}).then(function(){location.assign('
 function toast(msg,bad){var el=document.getElementById('toast');el.textContent=msg;el.className='toast'+(bad?' err':'');el.style.display='block';clearTimeout(toastTimer);toastTimer=setTimeout(function(){el.style.display='none'},3500)}
 function selectedAccount(){return (S.accounts||[]).find(function(a){return a.id===accountId})}
 function showView(name){activeView=name;document.querySelectorAll('.view').forEach(function(x){x.classList.toggle('sel',x.id===name)});document.querySelectorAll('.nav button').forEach(function(x){x.classList.toggle('sel',x.dataset.view===name)})}
-function selectAccount(id){accountId=id;pairCode='';loadState().then(function(){toast('Account selected.')}).catch(function(e){toast(e.message,true)})}
+function selectAccount(id){accountId=id;pairCode='';document.querySelectorAll('.jobList,.jobRecipient').forEach(function(x){x.checked=false});document.getElementById('jobMessage').value='';document.getElementById('jobFeedback').textContent='';return loadState().then(function(){toast('Account selected.')}).catch(function(e){toast(e.message,true)})}
 function switchJobAccount(id){if(id&&id!==accountId)selectAccount(id)}
 function loadState(){var url='/api/state'+(accountId?'?accountId='+encodeURIComponent(accountId):'');return api(url).then(function(d){S=d;accountId=d.selectedAccountId||'';render();return d})}
 function refresh(){var draft={name:document.getElementById('newAccountName')?.value||'',phone:document.getElementById('newAccountPhone')?.value||''};return loadState().then(function(){var a=document.getElementById('newAccountName'),p=document.getElementById('newAccountPhone');if(a)a.value=draft.name;if(p)p.value=draft.phone})}
@@ -927,9 +962,46 @@ function loadGroups(){if(!accountId)return toast('Select an account first.',true
 function renderGroups(){var names=Object.keys(S.cfg.groupLists||{});document.getElementById('listCards').innerHTML=names.map(function(n,i){var selected=S.cfg.groupLists[n]||[];return '<article class="card"><div class="row"><h3 class="grow">'+esc(n)+'</h3><span class="pill">'+selected.length+' groups</span><button class="secondary" onclick="renameList('+i+')">Rename</button><button class="danger" onclick="deleteList('+i+')">Delete</button></div><details><summary>Choose groups</summary><div class="groupbox">'+(S.groups||[]).map(function(g,j){return '<label><input type="checkbox" '+(selected.includes(g.id)?'checked ':'')+'onchange="toggleGroup('+i+','+j+',this.checked)"> '+esc(g.subject)+'</label>'}).join('')+'</div></details></article>'}).join('')||'<p class="muted">Create a group list to organize recipients.</p>';document.getElementById('recipientCards').innerHTML=(S.cfg.recipients||[]).map(function(r,i){return '<div class="row"><b class="grow">'+esc(r.name||('Recipient '+(i+1)))+'</b><span>'+esc(r.phone.replace(/\d(?=\d{4})/g,'•'))+'</span><button class="danger" onclick="removeRecipient(\''+esc(r.id)+'\')">Remove</button></div>'}).join('')||'<p class="muted">No individual numbers saved.</p>'}
 function addRecipient(){var phone=document.getElementById('recipientPhone').value.trim(),name=document.getElementById('recipientName').value.trim();if(!/^[+()\d\s.-]+$/.test(phone)||phone.replace(/\D/g,'').length<8||phone.replace(/\D/g,'').length>15){toast('Enter a valid number with country code.',true);return}api('/api/accounts/'+encodeURIComponent(accountId)+'/recipients','POST',{phone:phone,name:name}).then(function(){document.getElementById('recipientPhone').value='';document.getElementById('recipientName').value='';toast('Recipient added.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function removeRecipient(id){api('/api/accounts/'+encodeURIComponent(accountId)+'/recipients/'+encodeURIComponent(id),'DELETE').then(function(){toast('Recipient removed.');return loadState()}).catch(function(e){toast(e.message,true)})}
-function scheduleMode(){var m=document.getElementById('jobMode').value;document.getElementById('dateWrap').classList.toggle('hidden',m!=='at');document.getElementById('cronWrap').classList.toggle('hidden',m!=='cron')}
-function renderJobs(){var d=document.getElementById('jobAccount'),accountChoice=d.value||accountId,messageSelect=document.getElementById('jobMessage'),messageChoice=messageSelect.value;d.innerHTML=(S.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'" '+(a.id===accountId?'selected':'')+'>'+esc(a.name)+'</option>'}).join('');if((S.accounts||[]).some(function(a){return a.id===accountChoice}))d.value=accountChoice;messageSelect.innerHTML=(S.cfg.messages||[]).map(function(m){return '<option value="'+esc(m.id)+'">'+esc(m.name)+'</option>'}).join('')||'<option value="">Create a message first</option>';if((S.cfg.messages||[]).some(function(m){return m.id===messageChoice}))messageSelect.value=messageChoice;var selectedLists=[...document.querySelectorAll('.jobList:checked')].map(function(x){return x.value}),selectedRecipients=[...document.querySelectorAll('.jobRecipient:checked')].map(function(x){return x.value}),targets=[];Object.keys(S.cfg.groupLists||{}).forEach(function(n){targets.push('<label><input type="checkbox" class="jobList" value="'+esc(n)+'" '+(selectedLists.includes(n)?'checked':'')+'> '+esc(n)+'</label>')});(S.cfg.recipients||[]).forEach(function(r){targets.push('<label><input type="checkbox" class="jobRecipient" value="'+esc(r.id)+'" '+(selectedRecipients.includes(r.id)?'checked':'')+'> '+esc(r.name||r.phone)+'</label>')});document.getElementById('jobTargets').innerHTML=targets.join(' ')||'<span class="muted">Add recipients or group lists first.</span>';document.getElementById('jobCards').innerHTML=(S.cfg.jobs||[]).map(function(j){var m=S.cfg.messages.find(function(x){return x.id===j.messageId}),prog=j.total?j.progress+'/'+j.total:'—',recipientNames=(j.toRecipients||[]).map(function(id){var r=S.cfg.recipients.find(function(x){return x.id===id});return r?.name||r?.phone||''});var buttons='';if(j.status==='running')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='paused')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'resume\')">Resume</button>';if(j.status==='scheduled')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Start</button>';if(!['completed','cancelled','failed'].includes(j.status))buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'cancel\')">Cancel</button>';buttons+='<button class="danger" onclick="deleteJob(\''+esc(j.id)+'\')">Delete</button>';return '<article class="card"><div class="row"><h3 class="grow">'+esc(j.name)+'</h3>'+statusPill(j.status)+'</div><div>Account: '+esc(selectedAccount()?.name)+' · Message: '+esc(m?.name||'Missing')+' · Progress: '+esc(prog)+'</div><div class="muted">Recipients: '+esc([...(j.toLists||[]),...recipientNames].join(', '))+' · Created: '+esc(j.createdAt?new Date(j.createdAt).toLocaleString():'—')+' · Scheduled: '+esc(j.scheduledAt||'Now')+(j.completedAt?' · Completed: '+esc(new Date(j.completedAt).toLocaleString()):'')+'</div>'+(j.lastError?'<div class="muted">'+esc(j.lastError)+'</div>':'')+'<div class="actions">'+buttons+'</div></article>'}).join('')||'<p class="muted">No automations for this account yet.</p>'}
-document.addEventListener('change',function(e){if(e.target&&e.target.id==='jobAccount')switchJobAccount(e.target.value)})
+function jobFeedback(message,bad){var el=document.getElementById('jobFeedback');el.textContent=message;el.className='form-feedback'+(bad?' err':'');toast(message,bad)}
+function destinationMode(){
+  [['jobSendGroups','jobGroupPanel','groupChoice'],['jobToStatus','jobStatusPanel','statusChoice'],['jobSendContacts','jobContactPanel','']].forEach(function(item){
+    var on=document.getElementById(item[0]).checked;document.getElementById(item[1]).classList.toggle('hidden',!on);if(item[2])document.getElementById(item[2]).classList.toggle('selected',on)
+  });updateJobSummary()
+}
+function updateJobSummary(){
+  if(!S||!S.cfg)return;
+  var destinations=[],lists=[...document.querySelectorAll('.jobList:checked')],contacts=[...document.querySelectorAll('.jobRecipient:checked')];
+  if(document.getElementById('jobSendGroups').checked)destinations.push(lists.length+' group list'+(lists.length===1?'':'s'));
+  if(document.getElementById('jobToStatus').checked)destinations.push('WhatsApp Status');
+  if(document.getElementById('jobSendContacts').checked)destinations.push(contacts.length+' contact'+(contacts.length===1?'':'s'));
+  document.getElementById('jobDestinationSummary').textContent=destinations.join(' + ')||'Choose a destination';
+  var mode=document.getElementById('jobMode').value;
+  document.getElementById('jobScheduleSummary').textContent=mode==='at'?(document.getElementById('jobDate').value.replace('T',' ')||'Choose a date and time'):mode==='cron'?(document.getElementById('jobCron').value||'Set a recurring schedule'):'Send now';
+  var message=(S.cfg.messages||[]).find(function(m){return m.id===document.getElementById('jobMessage').value});
+  document.getElementById('jobPreview').textContent=message?(message.texts||[])[0]||'Media-only message':'Choose a saved message to preview it here.';
+  document.getElementById('jobMediaHint').textContent=message&&message.media?'Photo or video attached.':'';
+  var account=selectedAccount();document.getElementById('jobConnectionSummary').textContent=account?account.name+' ('+account.status.replace(/_/g,' ')+')':'Select an account';
+}
+function scheduleMode(){var m=document.getElementById('jobMode').value;document.getElementById('dateWrap').classList.toggle('hidden',m!=='at');document.getElementById('cronWrap').classList.toggle('hidden',m!=='cron');document.getElementById('createJobButton').textContent=m==='now'?'Send now':'Schedule automation';updateJobSummary()}
+function renderJobs(){
+  var d=document.getElementById('jobAccount'),accountChoice=accountId,messageSelect=document.getElementById('jobMessage'),messageChoice=messageSelect.value;
+  d.innerHTML=(S.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'" '+(a.id===accountId?'selected':'')+'>'+esc(a.name)+'</option>'}).join('');d.value=accountChoice;
+  messageSelect.innerHTML=(S.cfg.messages||[]).map(function(m){return '<option value="'+esc(m.id)+'">'+esc(m.name)+'</option>'}).join('')||'<option value="">Create a message first</option>';
+  if((S.cfg.messages||[]).some(function(m){return m.id===messageChoice}))messageSelect.value=messageChoice;
+  var selectedLists=[...document.querySelectorAll('.jobList:checked')].map(function(x){return x.value}),selectedRecipients=[...document.querySelectorAll('.jobRecipient:checked')].map(function(x){return x.value});
+  document.getElementById('jobTargets').innerHTML=Object.keys(S.cfg.groupLists||{}).map(function(n){return '<label class="target-option"><input type="checkbox" class="jobList" onchange="updateJobSummary()" value="'+esc(n)+'" '+(selectedLists.includes(n)?'checked':'')+'> '+esc(n)+'<small>'+S.cfg.groupLists[n].length+(S.cfg.groupLists[n].length===1?' group':' groups')+'</small></label>'}).join('')||'<p class="help">No group lists yet. Create a list in Recipients &amp; Groups.</p>';
+  document.getElementById('jobContactTargets').innerHTML=(S.cfg.recipients||[]).map(function(r){return '<label class="target-option"><input type="checkbox" class="jobRecipient" onchange="updateJobSummary()" value="'+esc(r.id)+'" '+(selectedRecipients.includes(r.id)?'checked':'')+'> '+esc(r.name||'Saved contact')+'</label>'}).join('')||'<p class="help">Add contacts in Recipients &amp; Groups.</p>';
+  var viewers=(S.cfg.statusRecipients||[]).length;document.getElementById('jobStatusAudience').textContent=viewers?viewers+' saved status viewer'+(viewers===1?'':'s')+' for this account.':'Add status viewers in Settings before posting to Status.';
+  document.getElementById('jobTimezone').textContent='Recurring schedules use '+(S.cfg.timezone||'Africa/Lagos')+'. One-time schedules use your browser timezone.';
+  document.getElementById('jobCards').innerHTML=(S.cfg.jobs||[]).map(function(j){
+    var m=S.cfg.messages.find(function(x){return x.id===j.messageId}),prog=j.total?j.progress+'/'+j.total:'Waiting',destinations=[];
+    if((j.toLists||[]).length)destinations.push('Groups: '+j.toLists.join(', '));if(j.toStatus)destinations.push('WhatsApp Status');if((j.toRecipients||[]).length)destinations.push(j.toRecipients.length+' contacts');
+    var buttons='';if(j.status==='running')buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'pause\')">Pause</button>';if(j.status==='paused')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'resume\')">Resume</button>';if(j.status==='scheduled')buttons+='<button onclick="jobAction(\''+esc(j.id)+'\',\'start\')">Start now</button>';if(!['completed','cancelled','failed'].includes(j.status))buttons+='<button class="secondary" onclick="jobAction(\''+esc(j.id)+'\',\'cancel\')">Cancel</button>';buttons+='<button class="danger" onclick="deleteJob(\''+esc(j.id)+'\')">Delete</button>';
+    return '<article class="card"><div class="row"><h3 class="grow">'+esc(j.name)+'</h3>'+statusPill(j.status)+'</div><div class="muted">'+esc(m?.name||'Missing message')+' &middot; '+esc(prog)+' deliveries processed'+(j.failedCount?' &middot; '+j.failedCount+' failed':'')+'</div><div class="job-destinations">'+destinations.map(function(n){return '<span class="pill">'+esc(n)+'</span>'}).join('')+'</div><p class="muted">Scheduled: '+esc(j.scheduleAt?new Date(j.scheduleAt).toLocaleString():j.cron||'Now')+(j.completedAt?' &middot; Finished: '+esc(new Date(j.completedAt).toLocaleString()):'')+'</p>'+(j.lastError?'<p class="form-feedback err">'+esc(j.lastError)+'</p>':'')+'<div class="actions">'+buttons+'</div></article>'
+  }).join('')||'<div class="empty-state"><strong>Your first campaign starts here.</strong><p>Choose a message, pick its destinations, and send or schedule it above.</p></div>';
+  destinationMode();scheduleMode()
+}
+document.addEventListener('change',function(e){if(e.target&&e.target.id==='jobAccount')switchJobAccount(e.target.value);if(e.target&&['jobDate','jobCron'].includes(e.target.id))updateJobSummary()})
 function renderAccounts(){
   var card=document.getElementById('accountCards')
   card.innerHTML=(S.accounts||[]).map(function(a){
@@ -943,7 +1015,23 @@ function renderAccounts(){
   if(pairCode&&pairAccountId===accountId)document.getElementById('pairCode').innerHTML='<div class="card"><h3>Pairing code for '+esc(selectedAccount()?.name)+'</h3><div class="stat">'+esc(pairCode)+'</div><p>On your phone open WhatsApp → Linked Devices → Link a device → Link with phone number, then enter this code.</p></div>'
   else document.getElementById('pairCode').innerHTML=''
 }
-function createJob(){var targetId=document.getElementById('jobAccount').value;if(targetId!==accountId){accountId=targetId;loadState().then(function(){document.querySelectorAll('.jobList,.jobRecipient').forEach(function(x){x.checked=false});toast('Account changed. Select this account’s recipients.');});return}if(!accountId){toast('Connect a WhatsApp account first.',true);return}var lists=[...document.querySelectorAll('.jobList:checked')].map(function(x){return x.value}),recipients=[...document.querySelectorAll('.jobRecipient:checked')].map(function(x){return x.value}),mode=document.getElementById('jobMode').value,body={name:document.getElementById('jobName').value,messageId:document.getElementById('jobMessage').value,toLists:lists,toRecipients:recipients,repeatCount:Number(document.getElementById('jobRepeat').value),delaySeconds:[Number(document.getElementById('jobMinDelay').value),Number(document.getElementById('jobMaxDelay').value)],toStatus:document.getElementById('jobToStatus').checked};if(mode==='at'){var date=document.getElementById('jobDate').value;if(!date){toast('Choose a scheduled date and time.',true);return}body.scheduleAt=new Date(date).toISOString()}if(mode==='cron')body.cron=document.getElementById('jobCron').value.trim();api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs','POST',body).then(function(d){toast(d.message);document.getElementById('jobName').value='';return loadState()}).catch(function(e){toast(e.message,true)})}
+function createJob(){
+  var button=document.getElementById('createJobButton');if(button.disabled)return;
+  var targetId=document.getElementById('jobAccount').value;if(targetId!==accountId){selectAccount(targetId).then(function(){jobFeedback('Account changed. Review its message and destinations before sending.');}).catch(function(e){jobFeedback(e.message,true)});return}
+  if(!accountId){jobFeedback('Select a WhatsApp account first.',true);return}
+  var sendGroups=document.getElementById('jobSendGroups').checked,sendContacts=document.getElementById('jobSendContacts').checked,toStatus=document.getElementById('jobToStatus').checked;
+  var lists=sendGroups?[...document.querySelectorAll('.jobList:checked')].map(function(x){return x.value}):[],recipients=sendContacts?[...document.querySelectorAll('.jobRecipient:checked')].map(function(x){return x.value}):[];
+  if(!sendGroups&&!sendContacts&&!toStatus){jobFeedback('Choose Groups, WhatsApp Status, or individual contacts.',true);return}
+  if(sendGroups&&!lists.length){jobFeedback('Choose at least one group list, or turn off Send to groups.',true);return}
+  if(sendContacts&&!recipients.length){jobFeedback('Choose at least one contact, or turn off individual contacts.',true);return}
+  if(toStatus&&!(S.cfg.statusRecipients||[]).length){jobFeedback('Add status viewers in Settings before posting to Status.',true);return}
+  var mode=document.getElementById('jobMode').value,body={name:document.getElementById('jobName').value.trim(),messageId:document.getElementById('jobMessage').value,toLists:lists,toRecipients:recipients,toStatus:toStatus,repeatCount:Number(document.getElementById('jobRepeat').value),delaySeconds:[Number(document.getElementById('jobMinDelay').value),Number(document.getElementById('jobMaxDelay').value)]};
+  if(!body.name||!body.messageId){jobFeedback('Enter an automation name and choose a saved message.',true);return}
+  if(mode==='at'){var date=new Date(document.getElementById('jobDate').value);if(!Number.isFinite(date.getTime())||date.getTime()<=Date.now()){jobFeedback('Choose a future date and time.',true);return}body.scheduleAt=date.toISOString()}
+  if(mode==='cron'){body.cron=document.getElementById('jobCron').value.trim();if(!body.cron){jobFeedback('Enter a recurring schedule.',true);return}}
+  button.disabled=true;button.textContent='Saving...';document.getElementById('jobFeedback').textContent='';
+  return api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs','POST',body).then(function(d){document.getElementById('jobName').value='';jobFeedback(d.message);return loadState()}).catch(function(e){jobFeedback(e.message,true)}).finally(function(){button.disabled=false;scheduleMode()})
+}
 function jobAction(id,action){var words={start:'started',pause:'paused',resume:'resumed',cancel:'cancelled'};api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(){toast('Job '+(words[action]||action)+'.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function deleteJob(id){if(!confirm('Delete this automation?'))return;api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id),'DELETE').then(function(){toast('Job deleted.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function renderSettings(){if(['timezone','defaultMin','defaultMax','statusRecipients'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1];document.getElementById('statusRecipients').value=(S.cfg.statusRecipients||[]).join('\n')}
