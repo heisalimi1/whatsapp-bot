@@ -15,7 +15,7 @@ async function waitFor(check, message) {
 }
 
 /** Optional real Chromium check. No browser package or runtime dependency required. */
-export async function checkDashboardBrowser({ base, cookie, accountId, messageId, screenshotDir }) {
+export async function checkDashboardBrowser({ base, cookie, secondCookie = cookie, accountId, messageId, screenshotDir }) {
   const executable = [
     process.env.DASHBOARD_TEST_BROWSER,
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -70,6 +70,36 @@ export async function checkDashboardBrowser({ base, cookie, accountId, messageId
     await command('Emulation.setDeviceMetricsOverride', { width: 1365, height: 1000, deviceScaleFactor: 1, mobile: false })
     await command('Page.navigate', { url: base })
     await waitFor(() => evaluate('typeof S !== "undefined" && S && !!S.cfg && S.selectedAccountId === ' + JSON.stringify(accountId)), 'The authenticated dashboard did not load.')
+    const { browserContextId } = await send('Target.createBrowserContext')
+    const secondTarget = await send('Target.createTarget', { url: 'about:blank', browserContextId })
+    const secondSession = await send('Target.attachToTarget', { targetId: secondTarget.targetId, flatten: true })
+    const mobileCommand = (method, params) => send(method, params, secondSession.sessionId)
+    const mobileEvaluate = async expression => {
+      const result = await mobileCommand('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })
+      if (result.exceptionDetails) throw new Error('Second browser evaluation failed: ' + result.exceptionDetails.text)
+      return result.result.value
+    }
+    await mobileCommand('Runtime.enable')
+    await mobileCommand('Network.enable')
+    await mobileCommand('Page.enable')
+    const secondEquals = secondCookie.indexOf('=')
+    await mobileCommand('Network.setCookie', { name: secondCookie.slice(0, secondEquals), value: secondCookie.slice(secondEquals + 1), url: base, httpOnly: true, secure: false })
+    await mobileCommand('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true })
+    await mobileCommand('Page.navigate', { url: base })
+    await waitFor(() => mobileEvaluate('typeof S!=="undefined"&&!!S?.cfg&&S.selectedAccountId===' + JSON.stringify(accountId)), 'The independent mobile dashboard did not load.')
+    assert.equal(await mobileEvaluate('S.account.status'), await evaluate('S.account.status'), 'both devices show the same backend connection state')
+    await mobileEvaluate('showView("messages");document.getElementById("messageName").value="Unsaved mobile draft";document.getElementById("messageName").focus()')
+    await evaluate('showView("groups");document.getElementById("newListName").value="Browser shared list";addList()')
+    assert.equal(await evaluate('Object.hasOwn(S.cfg.groupLists,"Browser shared list")'), false, 'creating a draft does not persist a group list')
+    await evaluate('(async function(){const names=groupListNames();const i=names.indexOf("Browser shared list");toggleGroup(i,0,true);await saveGroupSelection(i)})()')
+    await waitFor(() => mobileEvaluate('S.cfg.groupLists["Browser shared list"]?.[0]==="test-group@g.us"'), 'Focused mobile polling did not receive the group list saved by the desktop.')
+    assert.equal(await mobileEvaluate('document.getElementById("messageName").value'), 'Unsaved mobile draft', 'live polling preserves the focused form draft')
+    await mobileEvaluate('document.getElementById("messageName").blur();showView("groups")')
+    await waitFor(() => mobileEvaluate('document.getElementById("listCards").textContent.includes("Browser shared list")'), 'The mobile saved list did not render after blur.')
+    await mobileCommand('Page.reload', { ignoreCache: true })
+    await waitFor(() => mobileEvaluate('typeof S!=="undefined"&&S?.cfg?.groupLists["Browser shared list"]?.[0]==="test-group@g.us"'), 'The saved list did not survive the independent browser refresh.')
+    assert.deepEqual(await mobileEvaluate('S.groups'), await evaluate('S.groups'))
+    await evaluate('(async function(){delete S.cfg.groupLists["Browser shared list"];await saveData()})()')
     await evaluate('showView("jobs");document.getElementById("jobMessage").value=' + JSON.stringify(messageId) + ';updateJobSummary()')
     assert.equal(await evaluate('document.getElementById("jobPreview").textContent'), 'hi this is test message')
 

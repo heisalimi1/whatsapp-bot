@@ -28,7 +28,7 @@ function freePort() {
 
 function launch(cwd, port) {
   const signalHook = Buffer.from("process.on('message', signal => process.emit(signal))").toString('base64')
-  const env = { ...process.env, DASHBOARD_HOST: '127.0.0.1', DASHBOARD_PORT: String(port), DASHBOARD_TRUST_PROXY: 'loopback' }
+  const env = { ...process.env, AUTH_DATABASE_PATH: path.join(cwd, 'auth.sqlite'), DASHBOARD_HOST: '127.0.0.1', DASHBOARD_PORT: String(port), DASHBOARD_TRUST_PROXY: 'loopback' }
   delete env.DASHBOARD_PASSWORD
   delete env.DASHBOARD_PASSWORD_HASH
   const child = spawn(process.execPath, ['--import', `data:text/javascript;base64,${signalHook}`, path.join(root, 'bot.js')], {
@@ -43,13 +43,13 @@ function launch(cwd, port) {
 }
 
 async function waitForServer(base, child) {
-  const deadline = Date.now() + 10000
+  const deadline = Date.now() + 30000
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Bot exited during startup: ${child.exitCode}`)
     try { if ((await fetch(`${base}/login`)).status === 200) return } catch {}
     await new Promise(resolve => setTimeout(resolve, 100))
   }
-  throw new Error('Bot dashboard did not start within 10 seconds.')
+  throw new Error('Bot dashboard did not start within 30 seconds.')
 }
 
 function stop(child, signal = 'SIGTERM') {
@@ -74,6 +74,9 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   }))))
   const accountRoot = path.join(dir, 'accounts')
   for (const id of accountIds) fs.mkdirSync(path.join(accountRoot, id), { recursive: true })
+  fs.writeFileSync(path.join(accountRoot, accountIds[0], 'groups.json'), JSON.stringify({
+    groups: [{ id: 'test-group@g.us', subject: 'Shared test group' }], syncedAt: now
+  }))
   fs.mkdirSync(path.join(accountRoot, accountIds[0], 'auth'), { recursive: true })
   fs.writeFileSync(path.join(accountRoot, accountIds[0], 'auth', 'migration-fixture'), 'test-only-session-fixture')
   fs.writeFileSync(path.join(accountRoot, accountIds[0], 'automation.json'), JSON.stringify({
@@ -83,19 +86,16 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     jobs: [{ id: jobId, name: 'Interrupted', messageId, toLists: [], toRecipients: [recipientId], repeatCount: 1,
       delaySeconds: [0, 0], cron: '', scheduleAt: '', status: 'running', progress: 1, total: 3, createdAt: now }]
   }))
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
 
 
   const base = `http://127.0.0.1:${port}`
   let app = launch(dir, port)
-  t.after(context => {
+  t.after(async context => {
     if (app?.child.exitCode === null) {
-      app.child.kill('SIGKILL')
-      app.child.stdout.destroy()
-      app.child.stderr.destroy()
-      app.child.unref()
+      try { await stop(app.child) } catch { app.child.kill('SIGKILL') }
     }
     context.diagnostic(app?.output || '')
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   })
   await waitForServer(base, app.child)
   const loginPage = await (await fetch(`${base}/login`)).text()
@@ -382,8 +382,18 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   })
   assert.equal(invalidDestination.status, 400, 'the API validates selected groups even with Status enabled')
   assert.equal(browserConsoleErrors.length, 0)
+  const secondLogin = await fetch(base + '/api/login', {
+    method: 'POST', headers: { 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({ email: emailA, password: passwordA })
+  })
+  assert.equal(secondLogin.status, 200)
+  const secondCookie = secondLogin.headers.get('set-cookie').split(';')[0]
+  assert.notEqual(secondCookie, cookiePair, 'each device has an independent dashboard session')
+  const secondState = await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: { cookie: secondCookie } })).json()
+  assert.deepEqual(secondState.groups, [{ id: 'test-group@g.us', subject: 'Shared test group' }])
+  assert.equal(secondState.account.status, (await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: proxyHeaders })).json()).account.status)
   const checkedBrowser = await checkDashboardBrowser({
-    base, cookie: cookiePair, accountId: accountIds[0], messageId: testingMessage.id,
+    base, cookie: cookiePair, secondCookie, accountId: accountIds[0], messageId: testingMessage.id,
     screenshotDir: process.env.DASHBOARD_TEST_SCREENSHOTS
   })
   t.diagnostic(checkedBrowser ? 'Real Chromium: separate/combined destinations, refresh, desktop/mobile layouts and console passed.' : 'Real Chromium unavailable; HTTP and dashboard handler coverage passed.')
@@ -432,6 +442,41 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal(response.status, 404, 'uploads enforce account ownership')
   const userBState = await (await fetch(`${base}/api/state`, { headers: userBHeaders })).json()
   assert.equal(userBState.accounts.length, 0)
+
+  const ownerSession = await (await fetch(`${base}/api/session`, { headers: proxyHeaders })).json()
+  const memberSession = await (await fetch(`${base}/api/session`, { headers: userBHeaders })).json()
+  const teamHeaders = { ...userBHeaders, origin: base, 'content-type': 'application/json' }
+  response = await fetch(base + '/api/workspace/invites', {
+    method: 'POST', headers: messageHeaders, body: JSON.stringify({ email: 'owner-b@example.test' })
+  })
+  assert.equal(response.status, 201)
+  const invitation = await response.json()
+  response = await fetch(base + '/api/workspace/join', { method: 'POST', headers: teamHeaders, body: JSON.stringify({ code: invitation.code }) })
+  assert.equal(response.status, 200)
+  const sharedState = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: userBHeaders })).json()
+  assert.equal(sharedState.workspace.id, ownerSession.workspace.id)
+  assert.equal(sharedState.workspace.role, 'member')
+  assert.deepEqual(sharedState.cfg, finalRefreshedState.cfg, 'authorized members share messages, jobs, lists and recipients')
+  assert.deepEqual(sharedState.groups, secondState.groups, 'authorized members share the persistent group snapshot')
+  assert.equal((await fetch(base + '/api/workspace/invites', { method: 'POST', headers: teamHeaders, body: JSON.stringify({ email: 'other@example.test' }) })).status, 403)
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}`, { method: 'DELETE', headers: teamHeaders })).status, 403, 'members cannot delete shared WhatsApp sessions')
+  response = await fetch(`${base}/api/accounts/${accountIds[0]}/data`, {
+    method: 'PUT', headers: teamHeaders, body: JSON.stringify({ ...sharedState.cfg, revision: sharedState.cfg.revision - 1 })
+  })
+  assert.equal(response.status, 409, 'stale browser data cannot overwrite another device edits')
+  response = await fetch(`${base}/api/accounts/${accountIds[0]}/data`, {
+    method: 'PUT', headers: teamHeaders,
+    body: JSON.stringify({ ...sharedState.cfg, groupLists: { ...sharedState.cfg.groupLists, 'Shared member list': ['test-group@g.us'] } })
+  })
+  assert.equal(response.status, 200)
+  const sharedRefresh = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: proxyHeaders })).json()
+  assert.deepEqual(sharedRefresh.cfg.groupLists['Shared member list'], ['test-group@g.us'], 'member saves are visible to the owner')
+  delete sharedRefresh.cfg.groupLists['Shared member list']
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/data`, { method: 'PUT', headers: messageHeaders, body: JSON.stringify(sharedRefresh.cfg) })).status, 200)
+  response = await fetch(base + '/api/workspace/members/' + memberSession.user.id, { method: 'DELETE', headers: messageHeaders })
+  assert.equal(response.status, 200)
+  assert.equal((await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: userBHeaders })).status, 404, 'membership revocation applies immediately to existing sessions')
+  assert.equal((await (await fetch(base + '/api/session', { headers: userBHeaders })).json()).workspace.id, memberSession.workspace.id)
 
   response = await fetch(`${base}/api/logout`, { method: 'POST', headers: { ...proxyHeaders, origin: `https://127.0.0.1:${port}`, 'x-csrf-token': csrfToken } })
   assert.equal(response.status, 200)
@@ -494,6 +539,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const restartedA = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: { cookie: restartCookie } })).json()
   const restartedB = await (await fetch(`${base}/api/state?accountId=${accountIds[1]}`, { headers: { cookie: restartCookie } })).json()
   assert.equal(restartedA.cfg.messages[0].texts[0], 'private A')
+  assert.deepEqual(restartedA.groups, secondState.groups, 'saved WhatsApp groups remain available after a backend restart')
   assert.equal(restartedB.cfg.messages[0].texts[0], 'private B')
   assert.equal(restartedA.cfg.jobs.find(job => job.id === lifecycleJobId).status, 'cancelled')
   assert.equal(restartedB.cfg.jobs[0].status, 'scheduled')

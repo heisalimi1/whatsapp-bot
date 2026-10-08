@@ -5,12 +5,13 @@ import https from 'https'
 import fs from 'fs'
 import path from 'path'
 import { listAccounts, getAccountSocket, getAccountStatusAudience, syncAccountContacts, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected } from './whatsapp-manager.js'
-import { loadAutomation, saveAutomation, makeId } from './automation-store.js'
+import { loadAutomation, saveAutomation, loadGroupSnapshot, saveGroupSnapshot, makeId } from './automation-store.js'
 import { normalizeDestinations, buildDeliveryPlan, sendDelivery } from './automation-delivery.js'
 import { allowRate, tokensMatch } from './dashboard-security.js'
 import { cleanupExpiredAuthRecords, closeAuthStore, consumePasswordReset, createPasswordReset, createSession, createUser, destroySession, findUser, normalizeEmail, sessionForRequest, verifyUserPassword } from './auth-store.js'
 import { sendPasswordResetEmail } from './password-reset-mailer.js'
 import { FORGOT_PASSWORD_PAGE, LOGIN_PAGE as AUTH_LOGIN_PAGE, RESET_PASSWORD_PAGE, SIGNUP_PAGE } from './auth-pages.js'
+import { workspaceContext, selectWorkspace, workspaceMembers, createWorkspaceInvite, acceptWorkspaceInvite, removeWorkspaceMember, renameWorkspace, closeWorkspaceStore } from './workspace-store.js'
 
 if (typeof process.loadEnvFile === 'function' && fs.existsSync('.env')) {
   try { process.loadEnvFile(path.resolve('.env')) }
@@ -97,6 +98,9 @@ async function dataFor(accountId) {
     groupLists: cfg.groupLists, jobs: cfg.jobs
   } : {}
   const data = loadAutomation(accountId, legacy)
+  if (!accountGroups.has(accountId)) {
+    try { const snapshot = loadGroupSnapshot(accountId); accountGroups.set(accountId, snapshot.groups); groupSyncTimes.set(accountId, snapshot.syncedAt) } catch { log('Saved group snapshot could not be loaded for account', accountId) }
+  }
   accountData.set(accountId, data)
   return data
   })()
@@ -108,7 +112,7 @@ function saveAccountData(accountId, data) { accountData.set(accountId, data); sa
 
 function publicAutomation(data) {
   return {
-    timezone: data.timezone, delaySeconds: data.delaySeconds, statusRecipients: data.statusRecipients,
+    revision: data.revision || 0, timezone: data.timezone, delaySeconds: data.delaySeconds, statusRecipients: data.statusRecipients,
     groupLists: data.groupLists,
     recipients: (data.recipients || []).map(({ id, name, phone }) => ({ id, name, phone })),
     messages: (data.messages || []).map(({ id, name, texts, media, createdAt, updatedAt }) => ({ id, name, texts, media, createdAt, updatedAt })),
@@ -133,6 +137,24 @@ function normalizeGroupLists(accountId, data, groups) {
     })
   }
   if (changed) saveAccountData(accountId, data)
+}
+
+const groupSyncs = new Map(), groupSyncTimes = new Map()
+async function refreshAccountGroups(accountId) {
+  if (groupSyncs.has(accountId)) return groupSyncs.get(accountId)
+  const operation = (async () => {
+    const socket = await getAccountSocket(accountId)
+    if (!socket) throw new Error('Connect this WhatsApp account to refresh its groups.')
+    const groups = Object.values(await socket.groupFetchAllParticipating()).map(g => ({ id: g.id, subject: g.subject })).sort((a,b) => a.subject.localeCompare(b.subject))
+    // Ignore a response from a socket replaced while this fetch was in progress.
+    if (await getAccountSocket(accountId) !== socket) throw new Error('WhatsApp connection changed. Please refresh groups again.')
+    const snapshot = saveGroupSnapshot(accountId, groups)
+    accountGroups.set(accountId, groups); groupSyncTimes.set(accountId, snapshot.syncedAt)
+    normalizeGroupLists(accountId, await dataFor(accountId), groups)
+    return groups
+  })()
+  groupSyncs.set(accountId, operation)
+  try { return await operation } finally { if (groupSyncs.get(accountId) === operation) groupSyncs.delete(accountId) }
 }
 
 function pickText(message, key) {
@@ -356,6 +378,9 @@ function auth(req, res, next) {
   if (!session) return res.status(401).json({ error: 'Your session expired. Sign in again.' })
   req.dashboardSession = session
   req.user = session.user
+  const context = workspaceContext(req.user.id)
+  req.workspace = context.workspace
+  req.workspaces = context.workspaces
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     const origin = req.get('origin')
     const expectedOrigin = `${req.protocol}://${req.get('host')}`
@@ -459,7 +484,7 @@ async function shutdown(reason, exitCode = 0) {
     await Promise.race([Promise.allSettled([...activeJobPromises.values()]), sleep(Math.max(0, stopAt - Date.now()))])
     if (dashboardServer?.listening) dashboardServer.closeAllConnections?.()
     try { await closeAllAccounts() } catch (e) { log('Could not close all WhatsApp sockets cleanly:', e.message); process.exitCode = 1 }
-    try { closeAuthStore() } catch (e) { log('Could not close the authentication database cleanly:', e.message); process.exitCode = 1 }
+    try { closeWorkspaceStore(); closeAuthStore() } catch (e) { log('Could not close the authentication database cleanly:', e.message); process.exitCode = 1 }
     log('Graceful shutdown complete')
     process.exit(process.exitCode || 0)
   })()
@@ -587,11 +612,40 @@ function startDashboard() {
   app.use('/api', (req, res, next) => allowRate(req.ip || 'unknown', 'api', 300, 60 * 1000) ? next() : res.status(429).json({ error: 'Too many requests. Wait a moment and try again.' }))
   app.use('/api/accounts/:id', async (req, res, next) => {
     try {
-      if (!await ownsAccount(req.params.id, req.user.id)) return res.status(404).json({ error: 'WhatsApp account not found.' })
+      if (!await ownsAccount(req.params.id, req.workspace.id)) return res.status(404).json({ error: 'WhatsApp account not found in this business workspace.' })
       next()
     } catch { res.status(500).json({ error: 'We could not load this WhatsApp account.' }) }
   })
-  app.get('/api/session', (req, res) => res.json({ csrfToken: req.dashboardSession.csrfToken, expiresAt: req.dashboardSession.expiresAt, user: req.user }))
+  app.get('/api/session', (req, res) => res.json({ csrfToken: req.dashboardSession.csrfToken, expiresAt: req.dashboardSession.expiresAt, user: req.user, workspace: req.workspace, workspaces: req.workspaces }))
+  app.post('/api/workspaces/select', (req, res) => {
+    try { res.json({ ok: true, workspace: selectWorkspace(req.user.id, req.body?.workspaceId) }) }
+    catch { res.status(404).json({ error: 'Business workspace not found.' }) }
+  })
+  app.get('/api/workspace/members', (req, res) => {
+    try { res.json({ members: workspaceMembers(req.user.id, req.workspace.id) }) }
+    catch { res.status(403).json({ error: 'Only the business owner can manage members.' }) }
+  })
+  app.post('/api/workspace/invites', (req, res) => {
+    if (req.workspace.role !== 'owner') return res.status(403).json({ error: 'Only the business owner can invite members.' })
+    if (!allowRate(req.user.id, 'workspace-invites', 10, 60 * 60 * 1000)) return res.status(429).json({ error: 'Please wait before creating more invitations.' })
+    try { res.status(201).json({ ok: true, ...createWorkspaceInvite(req.user.id, req.workspace.id, req.body?.email) }) }
+    catch { res.status(400).json({ error: 'Enter a valid email for the member you want to invite.' }) }
+  })
+  app.post('/api/workspace/join', (req, res) => {
+    if (!allowRate(req.user.id, 'workspace-join', 10, 60 * 60 * 1000)) return res.status(429).json({ error: 'Please wait before trying another invitation.' })
+    try { res.json({ ok: true, ...acceptWorkspaceInvite(req.user.id, req.body?.code) }) }
+    catch { res.status(400).json({ error: 'The invitation is invalid, expired, already used, or belongs to another email.' }) }
+  })
+  app.delete('/api/workspace/members/:memberId', (req, res) => {
+    if (req.workspace.role !== 'owner') return res.status(403).json({ error: 'Only the business owner can manage members.' })
+    try { removeWorkspaceMember(req.user.id, req.workspace.id, req.params.memberId); res.json({ ok: true }) }
+    catch { res.status(400).json({ error: 'Only existing non-owner members can be removed.' }) }
+  })
+  app.put('/api/workspace', (req, res) => {
+    if (req.workspace.role !== 'owner') return res.status(403).json({ error: 'Only the business owner can rename it.' })
+    try { renameWorkspace(req.user.id, req.workspace.id, req.body?.name); res.json({ ok: true }) }
+    catch { res.status(400).json({ error: 'Use a business name from 1 to 80 printable characters.' }) }
+  })
   app.post('/api/logout', (req, res) => {
     destroySession(req)
     res.set('Set-Cookie', `wa_dashboard_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${(remoteBind || req.secure) ? '; Secure' : ''}`)
@@ -599,7 +653,7 @@ function startDashboard() {
   })
 
   app.get('/health', async (req, res) => {
-    const accounts = await listAccounts(req.user.id)
+    const accounts = await listAccounts(req.workspace.id)
     const connections = { connected: 0, connecting: 0, reconnecting: 0, disconnected: 0, other: 0 }
     for (const account of accounts) {
       if (account.status in connections) connections[account.status]++
@@ -616,7 +670,7 @@ function startDashboard() {
   })
 
   app.get('/api/state', async (req, res) => {
-    const accounts = await listAccounts(req.user.id)
+    const accounts = await listAccounts(req.workspace.id)
     const selectedAccountId = String(req.query.accountId || accounts[0]?.id || '')
     const account = accounts.find(a => a.id === selectedAccountId)
     if (selectedAccountId && !account) return res.status(404).json({ error: 'Account not found.' })
@@ -625,10 +679,11 @@ function startDashboard() {
     for (const a of accounts) {
       try { for (const j of (await dataFor(a.id)).jobs) overviewJobs.push({ id: j.id, name: j.name, status: j.status, createdAt: j.createdAt, scheduledAt: j.scheduledAt, accountName: a.name, accountId: a.id }) } catch {}
     }
-    res.json({ accounts, account, selectedAccountId, cfg: publicAutomation(data), groups: accountGroups.get(selectedAccountId) || [], jobs: overviewJobs, connected: accounts.some(a => a.status === 'connected') })
+    if (account?.status === 'connected' && (!groupSyncTimes.get(account.id) || Date.now() - Date.parse(groupSyncTimes.get(account.id)) > 60000)) refreshAccountGroups(account.id).catch(() => {})
+    res.json({ workspace: req.workspace, workspaces: req.workspaces, accounts, account, selectedAccountId, cfg: publicAutomation(data), groups: accountGroups.get(selectedAccountId) || [], groupsSyncedAt: groupSyncTimes.get(selectedAccountId) || null, jobs: overviewJobs, connected: accounts.some(a => a.status === 'connected') })
   })
 
-  app.get('/api/accounts', async (req, res) => res.json({ accounts: await listAccounts(req.user.id) }))
+  app.get('/api/accounts', async (req, res) => res.json({ accounts: await listAccounts(req.workspace.id) }))
   app.get('/api/accounts/:id', async (req, res) => {
     const account = await getAccount(req.params.id)
     if (!account) return res.status(404).json({ error: 'Account not found.' })
@@ -639,7 +694,7 @@ function startDashboard() {
       if (!allowRate(req.ip || 'unknown', 'create-account', 3, 15 * 60 * 1000)) return res.status(429).json({ error: 'Too many account creation requests. Try again later.' })
       const phone = String(req.body?.phone || '').trim()
       if (!/^[+()\d\s.-]+$/.test(phone)) return res.status(400).json({ error: 'Enter a valid phone number with country code.' })
-      const result = await createAccount({ userId: req.user.id, name: req.body?.name, phone })
+      const result = await createAccount({ userId: req.user.id, workspaceId: req.workspace.id, name: req.body?.name, phone })
       res.status(201).json(result)
     } catch (e) { log('Could not create WhatsApp account:', e?.message || 'unknown error'); res.status(400).json({ error: 'Could not create WhatsApp account. Check the phone number and try again.' }) }
   })
@@ -655,13 +710,14 @@ function startDashboard() {
     catch (e) { log('Could not disconnect WhatsApp account:', e?.message || 'unknown error'); res.status(400).json({ error: 'Could not disconnect this WhatsApp account.' }) }
   })
   app.delete('/api/accounts/:id', async (req, res) => {
+    if (req.workspace.role !== 'owner') return res.status(403).json({ error: 'Only the business owner can remove a WhatsApp account.' })
     try {
       const id = req.params.id
       if ([...runningJobs].some(key => key.startsWith(`${id}:`))) return res.status(409).json({ error: 'Pause or cancel this account’s running jobs before removing it.' })
       const result = await removeAccount(id)
       for (const task of cronTasks.get(id)?.values() || []) task.stop()
       for (const timer of oneShotTimers.get(id)?.values() || []) clearTimeout(timer)
-      cronTasks.delete(id); oneShotTimers.delete(id); accountGroups.delete(id); accountData.delete(id)
+      cronTasks.delete(id); oneShotTimers.delete(id); accountGroups.delete(id); groupSyncTimes.delete(id); accountData.delete(id)
       res.json(result)
     }
     catch (e) { log('Could not remove WhatsApp account:', e?.message || 'unknown error'); res.status(400).json({ error: 'Could not remove this WhatsApp account.' }) }
@@ -671,9 +727,7 @@ function startDashboard() {
     const sock = await getAccountSocket(req.params.id)
     if (!sock) return res.status(409).json({ error: 'Connect this WhatsApp account to load its groups.' })
     try {
-      const groups = Object.values(await sock.groupFetchAllParticipating()).map(g => ({ id: g.id, subject: g.subject })).sort((a, b) => a.subject.localeCompare(b.subject))
-      accountGroups.set(req.params.id, groups)
-      normalizeGroupLists(req.params.id, await dataFor(req.params.id), groups)
+      const groups = await refreshAccountGroups(req.params.id)
       res.json({ groups })
     } catch { res.status(502).json({ error: 'Unable to load groups from WhatsApp. Please retry.' }) }
   })
@@ -767,6 +821,7 @@ function startDashboard() {
   app.put('/api/accounts/:id/data', async (req, res) => {
     try {
       const previous = await dataFor(req.params.id)
+      if (req.body?.revision !== undefined && req.body.revision !== (previous.revision || 0)) return res.status(409).json({ error: 'This account changed on another device. Latest data has been loaded; review your changes and save again.' })
       const checked = validateData({ ...previous, ...req.body })
       if (checked.error) return res.status(400).json({ error: checked.error })
       const mediaRoots = [path.resolve('accounts', req.params.id, 'media'), path.resolve('images')]
@@ -791,7 +846,7 @@ function startDashboard() {
 
   app.post('/api/upload', async (req, res) => {
     const accountId = String(req.body?.accountId || '')
-    if (!await ownsAccount(accountId, req.user.id)) return res.status(404).json({ error: 'Choose a WhatsApp account first.' })
+    if (!await ownsAccount(accountId, req.workspace.id)) return res.status(404).json({ error: 'Choose a WhatsApp account in this business workspace.' })
     if (!allowRate(req.ip || 'unknown', `upload:${accountId}`, 20, 60 * 60 * 1000)) return res.status(429).json({ error: 'Upload limit reached. Try again later.' })
     const name = path.basename(String(req.body?.name || '')).replace(/[^a-zA-Z0-9._-]/g, '_').slice(-100)
     const ext = path.extname(name).toLowerCase()
@@ -878,7 +933,7 @@ function startDashboard() {
   })
 
   app.get('/api/log', async (req, res) => {
-    const ownedIds = (await listAccounts(req.user.id)).map(account => account.id)
+    const ownedIds = (await listAccounts(req.workspace.id)).map(account => account.id)
     res.json({ log: redactLogText(logBuffer.filter(line => ownedIds.some(id => line.includes(id))).slice(-60).join('\n')) })
   })
 
@@ -918,7 +973,7 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 .contacts-option{display:flex;align-items:center;gap:9px;margin-top:18px}.preview-panel{position:sticky;top:88px}.preview-panel h2{margin-top:0}.preview-text{white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;background:#f4f8f6;border-radius:10px;max-height:250px;overflow:auto;font-size:14px}.summary-line{display:flex;justify-content:space-between;gap:12px;margin:16px 0;font-size:14px}.summary-line span{color:var(--muted)}.summary-line strong{text-align:right}.submit-row{display:flex;justify-content:space-between;align-items:center;gap:12px}.submit-row button{padding:12px 20px}.form-feedback{margin-top:12px;font-size:14px;color:var(--green)}.form-feedback.err{color:#a93a36}.advanced{margin-top:16px}.advanced summary{cursor:pointer;color:var(--muted);font-size:14px}.advanced .field-grid{margin-top:12px}.job-destinations{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}.empty-state{padding:24px;text-align:center;border:1px dashed #cadbd3;border-radius:12px;color:var(--muted)}
 @media(max-width:850px){.automation-layout{grid-template-columns:1fr}.preview-panel{position:static}}@media(max-width:600px){header{flex-wrap:wrap}header b{flex:1 1 220px;white-space:nowrap}header select{order:3;max-width:none;margin:0;flex:1 1 calc(100% - 100px)}header>button{order:4}.field-grid,.destination-grid{grid-template-columns:1fr}.card{padding:16px}.page-heading{align-items:flex-start}.submit-row{align-items:flex-start;flex-direction:column}.submit-row button{width:100%}h1{font-size:26px}}
 </style></head><body>
-<header><b>Business WhatsApp</b><span id="topStatus" class="pill">Loading</span><select id="accountSelect" onchange="selectAccount(this.value)"></select><button class="secondary" onclick="logout()">Logout</button></header>
+<header><b>Business WhatsApp</b><select id="workspaceSelect" aria-label="Business workspace" onchange="switchWorkspace(this.value)"></select><span id="topStatus" class="pill">Loading</span><span id="syncState" class="muted" role="status" aria-live="polite">Checking server</span><select id="accountSelect" aria-label="WhatsApp account" onchange="selectAccount(this.value)"></select><button class="secondary" onclick="logout()">Logout</button></header>
 <main><nav class="nav"><button data-view="overview" onclick="showView('overview')">Overview</button><button data-view="accounts" onclick="showView('accounts')">Accounts</button><button data-view="messages" onclick="showView('messages')">Messages</button><button data-view="groups" onclick="showView('groups')">Recipients &amp; Groups</button><button data-view="jobs" onclick="showView('jobs')">Automations</button><button data-view="settings" onclick="showView('settings')">Settings</button></nav>
 <section id="overview" class="view"><h1>Dashboard</h1><div class="grid"><div class="card"><small>WhatsApp accounts</small><div class="stat" id="accountCount">0</div><button onclick="showView('accounts')">Manage accounts</button></div><div class="card"><small>Active jobs</small><div class="stat" id="activeCount">0</div><button onclick="showView('jobs')">View automations</button></div><div class="card"><small>Scheduled jobs</small><div class="stat" id="scheduledCount">0</div><button onclick="showView('jobs')">View schedule</button></div></div><div class="card"><h2>WhatsApp Accounts</h2><div id="overviewAccounts"></div><button onclick="showView('accounts')">＋ Connect WhatsApp</button></div><div class="card"><h2>Active Automations</h2><div id="overviewJobs"></div></div><div class="card"><h2>Recent Activity</h2><pre id="overviewLog"></pre></div><div class="card"><h2>Quick actions</h2><div class="actions"><button onclick="showView('accounts')">Connect WhatsApp</button><button onclick="newMessage();showView('messages')">Create Message</button><button onclick="showView('groups')">Manage Groups</button><button onclick="showView('jobs')">Create Automation</button></div></div></section>
 <section id="accounts" class="view"><h1>WhatsApp Accounts</h1><div class="card"><h2>＋ Connect WhatsApp</h2><div class="muted">Enter the phone number with country code. We’ll show a pairing code here.</div><div class="row"><input id="newAccountName" type="text" placeholder="Business or account name"><input id="newAccountPhone" type="tel" placeholder="+234 801 234 5678"><button onclick="connectAccount()">Connect WhatsApp</button></div><div id="pairCode"></div></div><div id="accountCards" class="grid"></div></section>
@@ -951,33 +1006,60 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 </div>
 <aside class="card preview-panel"><span class="eyebrow">Your campaign</span><h2>Ready to send?</h2><div id="jobPreview" class="preview-text">Choose a saved message to preview it here.</div><p id="jobMediaHint" class="help"></p><div class="summary-line"><span>Destinations</span><strong id="jobDestinationSummary">Choose a destination</strong></div><div class="summary-line"><span>Schedule</span><strong id="jobScheduleSummary">Send now</strong></div><div class="summary-line"><span>Sending interval</span><strong id="jobPacingSummary"></strong></div><div class="summary-line"><span>Account</span><strong id="jobConnectionSummary"></strong></div><small>Your messages and audience stay separate for each WhatsApp account.</small></aside>
 </div><div class="page-heading" style="margin-top:28px"><div><h2>Your automations</h2><p class="muted">Track deliveries and manage upcoming campaigns.</p></div></div><div id="jobCards"></div></section>
-<section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum wait (seconds)<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum wait (seconds)<input id="defaultMax" type="number" min="0" max="600"></label></div><p class="help">Use the same minimum and maximum for a fixed sending interval.</p><button onclick="saveSettings()">Save settings</button><h2>WhatsApp Status audience</h2><p class="help">Contacts sync from your WhatsApp account automatically. Manage who can see your Status in WhatsApp on your phone. You do not need to enter viewer numbers here.</p><button class="secondary" onclick="syncStatusContacts()">Sync WhatsApp contacts</button></div></section>
+<section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum wait (seconds)<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum wait (seconds)<input id="defaultMax" type="number" min="0" max="600"></label></div><p class="help">Use the same minimum and maximum for a fixed sending interval.</p><button onclick="saveSettings()">Save settings</button><h2>WhatsApp Status audience</h2><p class="help">Contacts sync from your WhatsApp account automatically. Manage who can see your Status in WhatsApp on your phone. You do not need to enter viewer numbers here.</p><button class="secondary" onclick="syncStatusContacts()">Sync WhatsApp contacts</button></div><div class="card"><h2>Business &amp; team</h2><p id="workspaceNameSummary" class="help"></p><div id="workspaceOwnerPanel"><label>Business name<input id="workspaceName" maxlength="80"></label><button class="secondary" onclick="saveWorkspaceName()">Save business name</button><h3>Invite a team member</h3><p class="help">Invite their dashboard email. Share the one-use code directly with them; it expires after 24 hours.</p><label>Member email<input id="workspaceInviteEmail" type="email" autocomplete="off"></label><button onclick="inviteWorkspaceMember()">Generate invitation</button><label>Invitation code<textarea id="workspaceInviteCode" readonly autocomplete="off"></textarea></label><button class="secondary" onclick="copyWorkspaceInvite()">Copy code</button><h3>Members</h3><button class="secondary" onclick="loadWorkspaceMembers()">Refresh members</button><div id="workspaceMembers"></div></div><h3>Join a business</h3><p class="help">Sign in with the email your business owner invited, then paste their invitation code.</p><label>Invitation code<input id="workspaceJoinCode" autocomplete="off"></label><button onclick="joinWorkspace()">Join business</button></div></section>
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 var S=null, accountId='', activeView='overview', editMessageId='', mediaPath='', pairCode='', pairAccountId='', toastTimer=null, csrfToken='';
 var groupListDrafts=new Map(),groupListOpenPanels=new Map(),renderedGroupAccountId='';
-var jobTimingAccount='',lastIntervalUnit=1;
+var jobTimingAccount='',lastIntervalUnit=1,stateGeneration=0,pollInFlight=false,membersLoadedFor='';
 function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
-function api(url,method,body){method=method||'GET';var headers={'Content-Type':'application/json'};if(method!=='GET'&&method!=='HEAD')headers['X-CSRF-Token']=csrfToken;return fetch(url,{method:method,headers:headers,body:body===undefined?undefined:JSON.stringify(body)}).then(async function(r){if(r.status===401){location.assign('/login');throw new Error('Sign in again.')}var d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed.');return d})}
+function api(url,method,body){method=method||'GET';var headers={'Content-Type':'application/json'};if(method!=='GET'&&method!=='HEAD')headers['X-CSRF-Token']=csrfToken;return fetch(url,{method:method,headers:headers,body:body===undefined?undefined:JSON.stringify(body)}).then(async function(r){if(r.status===401){location.assign('/login');throw new Error('Sign in again.')}var d=await r.json();if(!r.ok){var e=new Error(d.error||'Request failed.');e.status=r.status;throw e}return d})}
 function logout(){api('/api/logout','POST',{}).then(function(){location.assign('/login')}).catch(function(e){toast(e.message,true)})}
 function toast(msg,bad){var el=document.getElementById('toast');el.textContent=msg;el.className='toast'+(bad?' err':'');el.style.display='block';clearTimeout(toastTimer);toastTimer=setTimeout(function(){el.style.display='none'},3500)}
 function selectedAccount(){return (S.accounts||[]).find(function(a){return a.id===accountId})}
 function showView(name){activeView=name;document.querySelectorAll('.view').forEach(function(x){x.classList.toggle('sel',x.id===name)});document.querySelectorAll('.nav button').forEach(function(x){x.classList.toggle('sel',x.dataset.view===name)})}
 function selectAccount(id){accountId=id;pairCode='';document.querySelectorAll('.jobList,.jobRecipient').forEach(function(x){x.checked=false});document.getElementById('jobMessage').value='';document.getElementById('jobFeedback').textContent='';return loadState().then(function(){toast('Account selected.')}).catch(function(e){toast(e.message,true)})}
 function switchJobAccount(id){if(id&&id!==accountId)selectAccount(id)}
-function loadState(){var url='/api/state'+(accountId?'?accountId='+encodeURIComponent(accountId):'');return api(url).then(function(d){S=d;accountId=d.selectedAccountId||'';render();return d})}
+function loadState(options){
+  var generation=++stateGeneration,oldAccount=accountId,oldWorkspace=S?.workspace?.id,url='/api/state'+(accountId?'?accountId='+encodeURIComponent(accountId):'');
+  return api(url).catch(function(e){if(e.status===404&&oldAccount)return api('/api/state');throw e}).then(function(d){
+    if(generation!==stateGeneration)return d;
+    S=d;accountId=d.selectedAccountId||'';var changed=oldAccount!==accountId||oldWorkspace!==S.workspace?.id;
+    if(changed){pairCode='';pairAccountId='';jobTimingAccount='';document.getElementById('workspaceInviteCode').value='';}
+    if(selectedAccount()?.status==='connected')pairCode='';
+    document.getElementById('syncState').textContent='Live from server';
+    if(options?.background&&!changed&&/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||''))renderLiveStatus();else render();
+    return d
+  })
+}
+function renderLiveStatus(){var a=selectedAccount();document.getElementById('topStatus').textContent=a?a.status.replace(/_/g,' '):'No WhatsApp account';renderAccounts();}
+function pollState(){if(pollInFlight||document.hidden)return;pollInFlight=true;return loadState({background:true}).catch(function(){document.getElementById('syncState').textContent='Server temporarily unavailable; retrying'}).finally(function(){pollInFlight=false})}
+function switchWorkspace(id){return api('/api/workspaces/select','POST',{workspaceId:id}).then(function(){accountId='';pairCode='';groupListDrafts.clear();return loadState()}).catch(function(e){toast(e.message,true)})}
+function renderWorkspace(){
+  var context=S.workspace||{},selector=document.getElementById('workspaceSelect');
+  if(document.activeElement?.id!=='workspaceSelect'){selector.innerHTML=(S.workspaces||[]).map(function(w){return '<option value="'+esc(w.id)+'">'+esc(w.name)+'</option>'}).join('');selector.value=context.id||''}
+  document.getElementById('workspaceNameSummary').textContent=(context.name||'Business workspace')+' · '+(context.role||'member')+'. WhatsApp accounts and saved data are shared with authorized members.';
+  document.getElementById('workspaceOwnerPanel').classList.toggle('hidden',context.role!=='owner');
+  if(document.activeElement?.id!=='workspaceName')document.getElementById('workspaceName').value=context.name||'';
+  if(context.role==='owner'&&membersLoadedFor!==context.id){membersLoadedFor=context.id;loadWorkspaceMembers().catch(function(){})}
+}
+function loadWorkspaceMembers(){var workspaceId=S.workspace?.id;return api('/api/workspace/members').then(function(d){if(S.workspace?.id!==workspaceId)return;document.getElementById('workspaceMembers').innerHTML=d.members.map(function(m){return '<div class="row"><span class="grow">'+esc(m.fullName)+' · '+esc(m.email)+'</span><span class="pill">'+esc(m.role)+'</span>'+(m.role==='owner'?'':'<button class="danger" onclick="removeWorkspaceMember(\''+esc(m.id)+'\')">Remove member</button>')+'</div>'}).join('')})}
+function saveWorkspaceName(){return api('/api/workspace','PUT',{name:document.getElementById('workspaceName').value}).then(function(){toast('Business name saved.');return loadState()}).catch(function(e){toast(e.message,true)})}
+function inviteWorkspaceMember(){return api('/api/workspace/invites','POST',{email:document.getElementById('workspaceInviteEmail').value}).then(function(d){document.getElementById('workspaceInviteCode').value=d.code;toast('Invitation ready. Share it directly with the invited member.')}).catch(function(e){toast(e.message,true)})}
+function copyWorkspaceInvite(){var code=document.getElementById('workspaceInviteCode').value;if(!code){toast('Generate an invitation first.',true);return}if(navigator.clipboard)return navigator.clipboard.writeText(code).then(function(){toast('Invitation copied.')}).catch(function(){toast('Select the invitation code and copy it.',true)});document.getElementById('workspaceInviteCode').select();toast('Select the invitation code and copy it.')}
+function joinWorkspace(){return api('/api/workspace/join','POST',{code:document.getElementById('workspaceJoinCode').value.trim()}).then(function(){document.getElementById('workspaceJoinCode').value='';accountId='';return loadState()}).then(function(){toast('You joined the business. Its WhatsApp accounts are available here.')}).catch(function(e){toast(e.message,true)})}
+function removeWorkspaceMember(id){if(!confirm('Remove this member\'s access to this business?'))return;return api('/api/workspace/members/'+encodeURIComponent(id),'DELETE').then(function(){toast('Member access removed.');return loadWorkspaceMembers()}).catch(function(e){toast(e.message,true)})}
 function refresh(){var draft={name:document.getElementById('newAccountName')?.value||'',phone:document.getElementById('newAccountPhone')?.value||''};return loadState().then(function(){var a=document.getElementById('newAccountName'),p=document.getElementById('newAccountPhone');if(a)a.value=draft.name;if(p)p.value=draft.phone})}
 function render(){if(!S)return;var acc=selectedAccount(),sel=document.getElementById('accountSelect');sel.innerHTML=(S.accounts||[]).map(function(a){return '<option value="'+esc(a.id)+'" '+(a.id===accountId?'selected':'')+'>'+esc(a.name)+' · '+esc(a.phone)+'</option>'}).join('')||'<option value="">No accounts</option>';document.getElementById('topStatus').textContent=acc?acc.status.replace('_',' '):'No WhatsApp account';document.getElementById('accountCount').textContent=(S.accounts||[]).length;document.getElementById('activeCount').textContent=(S.jobs||[]).filter(function(j){return j.status==='running'}).length;document.getElementById('scheduledCount').textContent=(S.jobs||[]).filter(function(j){return j.status==='scheduled'}).length;renderOverview();renderAccounts();renderMessages();renderGroups();renderJobs();renderSettings();showView(activeView)}
 function statusPill(status){return '<span class="pill '+esc(status)+'">'+esc(String(status||'unknown').replace('_',' '))+'</span>'}
 function renderOverview(){document.getElementById('overviewAccounts').innerHTML=(S.accounts||[]).map(function(a){return '<div class="row"><b class="grow">'+esc(a.name)+'</b>'+esc(a.phone)+' '+statusPill(a.status)+' <button class="secondary" onclick="selectAccount(\''+esc(a.id)+'\').then(function(){showView(\'accounts\')})">Manage</button></div>'}).join('')||'<p class="muted">Connect a WhatsApp account to get started.</p>';document.getElementById('overviewJobs').innerHTML=(S.jobs||[]).slice(0,8).map(function(j){return '<div class="row"><b class="grow">'+esc(j.name)+'</b><span>'+esc(j.accountName)+'</span>'+statusPill(j.status)+'</div>'}).join('')||'<p class="muted">No automation jobs yet.</p>';api('/api/log').then(function(x){document.getElementById('overviewLog').textContent=x.log||'No recent activity.'}).catch(function(){})}
-function renderAccounts(){var card=document.getElementById('accountCards');card.innerHTML=(S.accounts||[]).map(function(a){var action=a.status==='connected'?'<button class="secondary" onclick="accountAction(\''+esc(a.id)+'\',\'disconnect\')">Disconnect</button>':(a.status==='logged_out'||a.status==='authentication_failure'?'<button onclick="pairAgain(\''+esc(a.id)+'\')">Connect</button>':'<button onclick="accountAction(\''+esc(a.id)+'\',\'reconnect\')">Reconnect</button>');return '<article class="card"><h3>'+esc(a.name)+'</h3><div>'+esc(a.phone)+' '+statusPill(a.status)+'</div><p class="muted">Last connected: '+esc(a.lastConnectedAt?new Date(a.lastConnectedAt).toLocaleString():'Never')+'</p>'+(a.error?'<p class="muted">'+esc(a.error)+'</p>':'')+'<div class="actions">'+action+'<button class="danger" onclick="removeAccount(\''+esc(a.id)+'\')">Remove</button></div></article>'}).join('');if(pairCode&&pairAccountId===accountId)document.getElementById('pairCode').innerHTML='<div class="card"><h3>Pairing code · '+esc(selectedAccount()?.name)+'</h3><div class="stat">'+esc(pairCode)+'</div><p>On your phone open WhatsApp → Linked Devices → Link a device → Link with phone number, then enter this code.</p></div>';else document.getElementById('pairCode').innerHTML=''}
 function connectAccount(){var name=document.getElementById('newAccountName').value,phone=document.getElementById('newAccountPhone').value;if(!/^[+()\d\s.-]+$/.test(phone)){toast('Enter a valid WhatsApp phone number.',true);return}api('/api/accounts','POST',{name:name,phone:phone}).then(function(d){accountId=d.account.id;pairAccountId=accountId;pairCode=d.pairingCode||'';return loadState()}).then(function(){toast(pairCode?'Pairing code generated.':'Connection starting.')}).catch(function(e){toast(e.message,true);refresh()})}
 function pairAgain(id){accountId=id;api('/api/accounts/'+encodeURIComponent(id)+'/reconnect','POST',{pair:true}).then(function(d){pairCode=d.pairingCode||'';pairAccountId=id;return loadState()}).then(function(){toast(pairCode?'Pairing code generated.':'Reconnecting.')}).catch(function(e){toast(e.message,true)})}
-function accountAction(id,action){api('/api/accounts/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(){toast(action==='disconnect'?'Account disconnected.':'Reconnection started.');return loadState()}).catch(function(e){toast(e.message,true)})}
+function accountAction(id,action){if(action==='disconnect'&&!confirm('Disconnect this WhatsApp account for everyone in this business?'))return;return api('/api/accounts/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(d){toast(action==='disconnect'?'Account disconnected.':d.reused?'This account is already connected.':'Reconnection started.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function removeAccount(id){if(!confirm('Remove this account and its session data?'))return;api('/api/accounts/'+encodeURIComponent(id),'DELETE').then(function(){if(accountId===id)accountId='';pairCode='';toast('Account removed.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function newMessage(){editMessageId='';mediaPath='';document.getElementById('messageFormTitle').textContent='Create message';document.getElementById('messageName').value='';document.getElementById('messageText').value='';document.getElementById('mediaLabel').textContent=''}
 function renderMessages(){if(!S.cfg)return;document.getElementById('messageCards').innerHTML=(S.cfg.messages||[]).map(function(m){var text=(m.texts||[]).join('\n---\n');return '<article class="card"><h3>'+esc(m.name)+'</h3><p class="message-preview">'+esc(text.slice(0,220))+(text.length>220?'…':'')+'</p><small>'+esc(m.media?'Media attached':'Text only')+'</small><div class="actions"><button class="secondary" onclick="editMessage(\''+esc(m.id)+'\')">Edit</button><button class="secondary" onclick="previewMessage(\''+esc(m.id)+'\')">Preview</button><button class="danger" onclick="deleteMessage(\''+esc(m.id)+'\')">Delete</button></div></article>'}).join('')||'<p class="muted">No messages saved for this account.</p>';if(!editMessageId)document.getElementById('mediaLabel').textContent=mediaPath?'Media ready: '+mediaPath:''}
-function saveData(success){if(!accountId){toast('Connect or select a WhatsApp account first.',true);return Promise.reject(new Error('No account selected.'))}return api('/api/accounts/'+encodeURIComponent(accountId)+'/data','PUT',S.cfg).then(function(){if(success)toast(success);return loadState()}).catch(function(e){toast(e.message,true);throw e})}
+function saveData(success){if(!accountId){toast('Connect or select a WhatsApp account first.',true);return Promise.reject(new Error('No account selected.'))}return api('/api/accounts/'+encodeURIComponent(accountId)+'/data','PUT',S.cfg).then(function(){if(success)toast(success);return loadState()}).catch(async function(e){if(e.status===409)await loadState();toast(e.message,true);throw e})}
 function saveMessage(){var name=document.getElementById('messageName').value.trim(),raw=document.getElementById('messageText').value,texts=raw.split(/\n\s*---\s*\n/).map(function(x){return x.trim()}).filter(Boolean);if(!name||(!texts.length&&!mediaPath)){toast('Enter a message name and text or media.',true);return}if(!accountId){toast('Select a WhatsApp account first.',true);return}var button=document.querySelector('#messages .actions button');if(button.disabled)return;var target='/api/accounts/'+encodeURIComponent(accountId)+'/messages',method='POST';if(editMessageId){target+='/'+encodeURIComponent(editMessageId);method='PUT'}button.disabled=true;api(target,method,{name:name,texts:texts,media:mediaPath}).then(function(d){newMessage();toast(d.message||'Message saved successfully.');return loadState()}).catch(function(e){toast(e.message,true)}).finally(function(){button.disabled=false})}
 function editMessage(id){var m=S.cfg.messages.find(function(x){return x.id===id});if(!m)return;editMessageId=id;mediaPath=m.media||'';document.getElementById('messageFormTitle').textContent='Edit message';document.getElementById('messageName').value=m.name;document.getElementById('messageText').value=(m.texts||[]).join('\n---\n');document.getElementById('mediaLabel').textContent=mediaPath||'';showView('messages');window.scrollTo(0,0)}
 function previewMessage(id){var m=id?S.cfg.messages.find(function(x){return x.id===id}):{name:document.getElementById('messageName').value,texts:document.getElementById('messageText').value.split(/\n\s*---\s*\n/),media:mediaPath};alert((m?.name||'Message')+'\n\n'+(m?.texts||[]).join('\n\n---\n\n')+(m?.media?'\n\nMedia: '+m.media:''))}
@@ -1131,10 +1213,10 @@ function renderAccounts(){
   card.innerHTML=(S.accounts||[]).map(function(a){
     var action=a.status==='connected'
       ? '<button class="secondary" onclick="accountAction(\''+esc(a.id)+'\',\'disconnect\')">Disconnect</button>'
-      : (!a.everConnected||a.status==='logged_out'||a.status==='authentication_failure'
+      : (a.requiresPairing && !['connecting','reconnecting'].includes(a.status)
         ? '<button onclick="pairAgain(\''+esc(a.id)+'\')">Connect / get code</button>'
-        : (a.status==='disconnected' ? '<button onclick="accountAction(\''+esc(a.id)+'\',\'reconnect\')">Reconnect</button>' : '<button disabled>Connecting…</button>'))
-    return '<article class="card"><h3>'+esc(a.name)+'</h3><div>'+esc(a.phone)+' '+statusPill(a.status)+'</div><p class="muted">Last connected: '+esc(a.lastConnectedAt?new Date(a.lastConnectedAt).toLocaleString():'Never')+'</p>'+(a.error?'<p class="muted">'+esc(a.error)+'</p>':'')+'<div class="actions">'+action+'<button class="danger" onclick="removeAccount(\''+esc(a.id)+'\')">Remove</button></div></article>'
+        : (['disconnected','temporarily_unavailable','authentication_failure'].includes(a.status) ? '<button onclick="accountAction(\''+esc(a.id)+'\',\'reconnect\')">Reconnect saved session</button>' : '<button disabled>Connecting…</button>'))
+    return '<article class="card"><h3>'+esc(a.name)+'</h3><div>'+esc(a.phone)+' '+statusPill(a.status)+'</div><p class="muted">Last connected: '+esc(a.lastConnectedAt?new Date(a.lastConnectedAt).toLocaleString():'Never')+'</p>'+(a.error?'<p class="muted">'+esc(a.error)+'</p>':'')+'<div class="actions">'+action+(S.workspace?.role==='owner'?'<button class="danger" onclick="removeAccount(\''+esc(a.id)+'\')">Remove</button>':'')+'</div></article>'
   }).join('')
   if(pairCode&&pairAccountId===accountId)document.getElementById('pairCode').innerHTML='<div class="card"><h3>Pairing code for '+esc(selectedAccount()?.name)+'</h3><div class="stat">'+esc(pairCode)+'</div><p>On your phone open WhatsApp → Linked Devices → Link a device → Link with phone number, then enter this code.</p></div>'
   else document.getElementById('pairCode').innerHTML=''
@@ -1159,17 +1241,18 @@ function createJob(){
 }
 function jobAction(id,action){var words={start:'started',pause:'paused',resume:'resumed',cancel:'cancelled'};api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id)+'/'+action,'POST',{}).then(function(){toast('Job '+(words[action]||action)+'.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function deleteJob(id){if(!confirm('Delete this automation?'))return;api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id),'DELETE').then(function(){toast('Job deleted.');return loadState()}).catch(function(e){toast(e.message,true)})}
-function renderSettings(){if(['timezone','defaultMin','defaultMax'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1]}
+function renderSettings(){renderWorkspace();if(['timezone','defaultMin','defaultMax'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1]}
 function saveSettings(){S.cfg.timezone=document.getElementById('timezone').value;S.cfg.delaySeconds=[Number(document.getElementById('defaultMin').value),Number(document.getElementById('defaultMax').value)];jobTimingAccount='';saveData('Settings saved.').catch(function(){})}
-fetch('/api/session').then(function(r){if(!r.ok){location.assign('/login');throw new Error('Sign in again.')}return r.json()}).then(function(x){csrfToken=x.csrfToken;return loadState()}).then(function(){showView('overview')}).catch(function(e){if(e.message!=='Sign in again.')toast(e.message,true)});setInterval(function(){if(!document.hidden&&!/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||''))refresh().catch(function(){})},5000);
+fetch('/api/session').then(function(r){if(!r.ok){location.assign('/login');throw new Error('Sign in again.')}return r.json()}).then(function(x){csrfToken=x.csrfToken;return loadState()}).then(function(){showView('overview')}).catch(function(e){if(e.message!=='Sign in again.')toast(e.message,true)});setInterval(pollState,3000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)pollState()});
+document.addEventListener('focusout',function(){setTimeout(function(){if(S&&!/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||''))render()},0)});
+window.addEventListener?.('online',pollState);window.addEventListener?.('focus',pollState);
 </script></body></html>`
 
 onAccountConnected(async (waSocket, accountId) => {
   log('WhatsApp account connected:', accountId)
   try {
-    const groups = Object.values(await waSocket.groupFetchAllParticipating()).map(g => ({ id: g.id, subject: g.subject }))
-    accountGroups.set(accountId, groups)
-    normalizeGroupLists(accountId, await dataFor(accountId), groups)
+    const groups = await refreshAccountGroups(accountId)
     log(`Loaded ${groups.length} groups for account ${accountId}`)
     const data = await dataFor(accountId)
     if (testJobName) {
@@ -1181,7 +1264,7 @@ onAccountConnected(async (waSocket, accountId) => {
       process.exit(0)
     }
     scheduleAccount(accountId, data)
-  } catch (e) { log('Could not load WhatsApp groups:', e.message) }
+  } catch (e) { log('Could not load WhatsApp groups:', e.message); scheduleAccount(accountId, await dataFor(accountId)) }
 })
 
 if (!testJobName) startDashboard()

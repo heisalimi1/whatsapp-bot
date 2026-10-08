@@ -4,7 +4,7 @@ import crypto from 'crypto'
 
 const root = path.resolve('accounts')
 const defaults = () => ({
-  timezone: 'Africa/Lagos', delaySeconds: [5, 15], statusRecipients: [], recipients: [],
+  revision: 0, timezone: 'Africa/Lagos', delaySeconds: [5, 15], statusRecipients: [], recipients: [],
   groupLists: {}, messages: [], jobs: []
 })
 
@@ -41,6 +41,7 @@ export function loadAutomation(accountId, legacy = {}) {
 }
 
 export function saveAutomation(accountId, data) {
+  data.revision = (Number.isSafeInteger(data.revision) ? data.revision : 0) + 1
   const file = fileFor(accountId)
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${crypto.randomUUID()}.tmp`
@@ -50,3 +51,21 @@ export function saveAutomation(accountId, data) {
 }
 
 export function makeId() { return crypto.randomUUID() }
+
+export function loadGroupSnapshot(accountId) {
+  const file = path.join(path.dirname(fileFor(accountId)), 'groups.json')
+  if (!fs.existsSync(file)) return { groups: [], syncedAt: null }
+  if (fs.lstatSync(file).isSymbolicLink()) throw new Error('Invalid group storage file.')
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (!Array.isArray(saved.groups)) throw new Error('Invalid saved group snapshot.')
+  return { groups: saved.groups.filter(g => typeof g.id === 'string' && typeof g.subject === 'string').map(({ id, subject }) => ({ id, subject })), syncedAt: saved.syncedAt || null }
+}
+export function saveGroupSnapshot(accountId, groups) {
+  const file = path.join(path.dirname(fileFor(accountId)), 'groups.json')
+  if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink()) throw new Error('Invalid group storage file.')
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  const snapshot = { groups, syncedAt: new Date().toISOString() }, tmp = `${file}.${crypto.randomUUID()}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(snapshot), { mode: 0o600, flag: 'wx' })
+  fs.renameSync(tmp, file)
+  return snapshot
+}
