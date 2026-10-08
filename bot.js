@@ -677,6 +677,29 @@ function startDashboard() {
       res.json({ groups })
     } catch { res.status(502).json({ error: 'Unable to load groups from WhatsApp. Please retry.' }) }
   })
+  app.put('/api/accounts/:id/group-lists/:name', async (req, res) => {
+    try {
+      const name = String(req.params.name || '').trim(), body = req.body || {}
+      if (!name || name.length > 80 || /[\u0000-\u001f\u007f]/.test(name)) return res.status(400).json({ error: 'Group list names must be 1 to 80 printable characters.' })
+      if (!Array.isArray(body.groups) || body.groups.length > 1000 || body.groups.some(id => typeof id !== 'string' || id.length > 160 || /[\u0000-\u001f\u007f]/.test(id))) return res.status(400).json({ error: 'Choose valid WhatsApp groups for this list.' })
+      const data = await dataFor(req.params.id), exists = Object.hasOwn(data.groupLists, name)
+      if (body.create === true && exists) return res.status(409).json({ error: 'A list with that name already exists. Choose a different name.' })
+      if (body.create !== true && !exists) return res.status(404).json({ error: 'This group list no longer exists. Refresh and try again.' })
+      if (!exists && Object.keys(data.groupLists).length >= 100) return res.status(409).json({ error: 'This account has reached its 100-group-list limit.' })
+      const groups = [...new Set(body.groups)]
+      if (!exists && !groups.length) return res.status(400).json({ error: 'Tick at least one group before saving a new list.' })
+      const allowed = new Set([...(accountGroups.get(req.params.id) || []).map(group => group.id), ...(exists ? data.groupLists[name] : [])])
+      if (groups.some(id => !allowed.has(id))) return res.status(400).json({ error: 'Refresh WhatsApp groups and choose groups belonging to this account.' })
+      const previousLists = data.groupLists
+      data.groupLists = { ...data.groupLists, [name]: groups }
+      try { saveAccountData(req.params.id, data) }
+      catch (e) { data.groupLists = previousLists; throw e }
+      res.json({ ok: true, groupList: { name, groups }, message: exists ? 'Group selection saved.' : 'Group list created with your selected groups.' })
+    } catch (e) {
+      log('Unable to save group list:', e?.message || 'unknown error')
+      res.status(500).json({ error: 'The group list could not be saved. Your selection is still available to retry.' })
+    }
+  })
   app.post('/api/accounts/:id/recipients', async (req, res) => {
     try {
       const data = await dataFor(req.params.id), phone = String(req.body?.phone || '').replace(/\D/g, '')
@@ -894,7 +917,7 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 <section id="overview" class="view"><h1>Dashboard</h1><div class="grid"><div class="card"><small>WhatsApp accounts</small><div class="stat" id="accountCount">0</div><button onclick="showView('accounts')">Manage accounts</button></div><div class="card"><small>Active jobs</small><div class="stat" id="activeCount">0</div><button onclick="showView('jobs')">View automations</button></div><div class="card"><small>Scheduled jobs</small><div class="stat" id="scheduledCount">0</div><button onclick="showView('jobs')">View schedule</button></div></div><div class="card"><h2>WhatsApp Accounts</h2><div id="overviewAccounts"></div><button onclick="showView('accounts')">＋ Connect WhatsApp</button></div><div class="card"><h2>Active Automations</h2><div id="overviewJobs"></div></div><div class="card"><h2>Recent Activity</h2><pre id="overviewLog"></pre></div><div class="card"><h2>Quick actions</h2><div class="actions"><button onclick="showView('accounts')">Connect WhatsApp</button><button onclick="newMessage();showView('messages')">Create Message</button><button onclick="showView('groups')">Manage Groups</button><button onclick="showView('jobs')">Create Automation</button></div></div></section>
 <section id="accounts" class="view"><h1>WhatsApp Accounts</h1><div class="card"><h2>＋ Connect WhatsApp</h2><div class="muted">Enter the phone number with country code. We’ll show a pairing code here.</div><div class="row"><input id="newAccountName" type="text" placeholder="Business or account name"><input id="newAccountPhone" type="tel" placeholder="+234 801 234 5678"><button onclick="connectAccount()">Connect WhatsApp</button></div><div id="pairCode"></div></div><div id="accountCards" class="grid"></div></section>
 <section id="messages" class="view"><h1>Messages</h1><div class="card"><h2 id="messageFormTitle">Create message</h2><input id="messageName" type="text" placeholder="Message name"><textarea id="messageText" placeholder="Message text. Separate rotating versions with a line containing ---"></textarea><div class="row"><input id="messageFile" type="file" accept="image/*,video/mp4,video/quicktime"><button class="secondary" onclick="uploadMessageMedia()">Upload media</button><span id="mediaLabel" class="muted"></span></div><div class="actions"><button onclick="saveMessage()">Save message</button><button class="secondary" onclick="previewMessage()">Preview</button><button class="secondary" onclick="newMessage()">Clear</button></div></div><div id="messageCards" class="grid"></div></section>
-<section id="groups" class="view"><h1>Recipients &amp; Groups</h1><div class="card"><h2>Individual numbers</h2><div class="row"><input id="recipientName" type="text" placeholder="Contact name (optional)"><input id="recipientPhone" type="tel" placeholder="Number with country code"><button onclick="addRecipient()">Add number</button></div><div id="recipientCards"></div></div><div class="card"><h2>Group Lists</h2><div class="row"><input id="newListName" type="text" placeholder="New group list name"><button onclick="addList()">Create Group List</button><button class="secondary" onclick="loadGroups()">Refresh WhatsApp groups</button></div><div id="listCards"></div></div></section>
+<section id="groups" class="view"><h1>Recipients &amp; Groups</h1><div class="card"><h2>Individual numbers</h2><div class="row"><input id="recipientName" type="text" placeholder="Contact name (optional)"><input id="recipientPhone" type="tel" placeholder="Number with country code"><button onclick="addRecipient()">Add number</button></div><div id="recipientCards"></div></div><div class="card"><h2>Group Lists</h2><p class="help">Create a draft list, tick the groups you want, and click Save selected groups.</p><div class="row"><input id="newListName" type="text" placeholder="New group list name"><button onclick="addList()">Create Group List</button><button class="secondary" onclick="loadGroups()">Refresh WhatsApp groups</button></div><div id="listCards"></div></div></section>
 <section id="jobs" class="view">
 <div class="page-heading"><div><span class="eyebrow">Campaign workspace</span><h1>Automations</h1><p class="muted">Send the right message to the right place, on your schedule.</p></div></div>
 <div class="automation-layout"><div class="card">
@@ -925,6 +948,7 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 var S=null, accountId='', activeView='overview', editMessageId='', mediaPath='', pairCode='', pairAccountId='', toastTimer=null, csrfToken='';
+var groupListDrafts=new Map(),groupListOpenPanels=new Map(),renderedGroupAccountId='';
 function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function api(url,method,body){method=method||'GET';var headers={'Content-Type':'application/json'};if(method!=='GET'&&method!=='HEAD')headers['X-CSRF-Token']=csrfToken;return fetch(url,{method:method,headers:headers,body:body===undefined?undefined:JSON.stringify(body)}).then(async function(r){if(r.status===401){location.assign('/login');throw new Error('Sign in again.')}var d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed.');return d})}
 function logout(){api('/api/logout','POST',{}).then(function(){location.assign('/login')}).catch(function(e){toast(e.message,true)})}
@@ -951,12 +975,87 @@ function editMessage(id){var m=S.cfg.messages.find(function(x){return x.id===id}
 function previewMessage(id){var m=id?S.cfg.messages.find(function(x){return x.id===id}):{name:document.getElementById('messageName').value,texts:document.getElementById('messageText').value.split(/\n\s*---\s*\n/),media:mediaPath};alert((m?.name||'Message')+'\n\n'+(m?.texts||[]).join('\n\n---\n\n')+(m?.media?'\n\nMedia: '+m.media:''))}
 function deleteMessage(id){if(S.cfg.jobs.some(function(j){return j.messageId===id})){toast('This message is used by a job. Delete or edit that job first.',true);return}if(!confirm('Delete this message?'))return;S.cfg.messages=S.cfg.messages.filter(function(m){return m.id!==id});saveData('Message deleted.').catch(function(){})}
 function uploadMessageMedia(){var f=document.getElementById('messageFile').files[0];if(!f||!accountId){toast('Choose a file and account first.',true);return}if(f.size>16*1024*1024){toast('File too large (max 16 MB).',true);return}var reader=new FileReader();reader.onload=function(){api('/api/upload','POST',{accountId:accountId,name:f.name,data:reader.result.split(',')[1]}).then(function(d){mediaPath=d.path;document.getElementById('mediaLabel').textContent='Media ready: '+mediaPath;toast('Media uploaded.')}).catch(function(e){toast(e.message,true)})};reader.readAsDataURL(f)}
-function addList(){var name=document.getElementById('newListName').value.trim();if(!name){toast('Enter a group list name.',true);return}if(S.cfg.groupLists[name]){toast('A list with that name already exists.',true);return}S.cfg.groupLists[name]=[];saveData('Group list created.').then(function(){document.getElementById('newListName').value=''}).catch(function(){})}
-function renameList(i){var names=Object.keys(S.cfg.groupLists),old=names[i],name=prompt('Rename group list',old);if(name===null)return;name=name.trim();if(!name|| (name!==old&&S.cfg.groupLists[name])){toast('Enter an unused list name.',true);return}S.cfg.groupLists[name]=S.cfg.groupLists[old];delete S.cfg.groupLists[old];S.cfg.jobs.forEach(function(j){j.toLists=(j.toLists||[]).map(function(n){return n===old?name:n})});saveData('Group list renamed.').catch(function(){})}
-function deleteList(i){var names=Object.keys(S.cfg.groupLists),name=names[i];if(!confirm('Delete group list “'+name+'”?'))return;delete S.cfg.groupLists[name];S.cfg.jobs.forEach(function(j){j.toLists=(j.toLists||[]).filter(function(n){return n!==name})});saveData('Group list deleted.').catch(function(){})}
-function toggleGroup(listIndex,groupIndex,on){var name=Object.keys(S.cfg.groupLists)[listIndex],id=S.groups[groupIndex].id,arr=S.cfg.groupLists[name],i=arr.indexOf(id);if(on&&i<0)arr.push(id);if(!on&&i>=0)arr.splice(i,1);clearTimeout(window.groupSaveTimer);window.groupSaveTimer=setTimeout(function(){saveData('Group selection saved.').catch(function(){})},700)}
-function loadGroups(){if(!accountId)return toast('Select an account first.',true);api('/api/accounts/'+encodeURIComponent(accountId)+'/groups').then(function(d){S.groups=d.groups;renderGroups();toast('WhatsApp groups refreshed.')}).catch(function(e){toast(e.message,true)})}
-function renderGroups(){var names=Object.keys(S.cfg.groupLists||{});document.getElementById('listCards').innerHTML=names.map(function(n,i){var selected=S.cfg.groupLists[n]||[];return '<article class="card"><div class="row"><h3 class="grow">'+esc(n)+'</h3><span class="pill">'+selected.length+' groups</span><button class="secondary" onclick="renameList('+i+')">Rename</button><button class="danger" onclick="deleteList('+i+')">Delete</button></div><details><summary>Choose groups</summary><div class="groupbox">'+(S.groups||[]).map(function(g,j){return '<label><input type="checkbox" '+(selected.includes(g.id)?'checked ':'')+'onchange="toggleGroup('+i+','+j+',this.checked)"> '+esc(g.subject)+'</label>'}).join('')+'</div></details></article>'}).join('')||'<p class="muted">Create a group list to organize recipients.</p>';document.getElementById('recipientCards').innerHTML=(S.cfg.recipients||[]).map(function(r,i){return '<div class="row"><b class="grow">'+esc(r.name||('Recipient '+(i+1)))+'</b><span>'+esc(r.phone.replace(/\d(?=\d{4})/g,'•'))+'</span><button class="danger" onclick="removeRecipient(\''+esc(r.id)+'\')">Remove</button></div>'}).join('')||'<p class="muted">No individual numbers saved.</p>'}
+function listDrafts(){if(!groupListDrafts.has(accountId))groupListDrafts.set(accountId,new Map());return groupListDrafts.get(accountId)}
+function listOpenPanels(){if(!groupListOpenPanels.has(accountId))groupListOpenPanels.set(accountId,new Set());return groupListOpenPanels.get(accountId)}
+function groupListNames(){return [...new Set([...Object.keys(S.cfg.groupLists||{}),...listDrafts().keys()])]}
+function savedGroupsForList(name){return Object.hasOwn(S.cfg.groupLists,name)?S.cfg.groupLists[name]:[]}
+function listSelectionDirty(name,draft){if(!draft)return false;var saved=savedGroupsForList(name);return draft.isNew||saved.length!==draft.groups.length||saved.some(function(id){return !draft.groups.includes(id)})}
+function validListName(name){return name.length>0&&name.length<=80&&!/[\u0000-\u001f\u007f]/.test(name)}
+function addList(){
+  if(!accountId){toast('Select a WhatsApp account first.',true);return}
+  var name=document.getElementById('newListName').value.trim(),drafts=listDrafts();
+  if(!validListName(name)){toast('Enter a group list name with 1 to 80 printable characters.',true);return}
+  if(Object.hasOwn(S.cfg.groupLists,name)||drafts.has(name)){toast('A list with that name already exists.',true);return}
+  drafts.set(name,{groups:[],isNew:true,saving:false,error:''});listOpenPanels().add(name);
+  document.getElementById('newListName').value='';renderGroups();toast('Tick your groups, then click Save selected groups to create the list.')
+}
+function renameList(i){
+  var old=groupListNames()[i],drafts=listDrafts(),draft=drafts.get(old);
+  if(draft?.saving)return;
+  if(draft&&!draft.isNew&&listSelectionDirty(old,draft)){toast('Save or discard your group selection before renaming this list.',true);return}
+  var name=prompt('Rename group list',old);if(name===null)return;name=name.trim();
+  if(!validListName(name)||(name!==old&&(Object.hasOwn(S.cfg.groupLists,name)||drafts.has(name)))){toast('Enter an unused list name with 1 to 80 printable characters.',true);return}
+  if(name===old)return;
+  if(draft?.isNew){drafts.delete(old);drafts.set(name,draft);listOpenPanels().delete(old);listOpenPanels().add(name);renderGroups();return}
+  S.cfg.groupLists[name]=S.cfg.groupLists[old];delete S.cfg.groupLists[old];S.cfg.jobs.forEach(function(j){j.toLists=(j.toLists||[]).map(function(n){return n===old?name:n})});
+  saveData('Group list renamed.').then(function(){drafts.delete(old);listOpenPanels().delete(old);listOpenPanels().add(name);renderGroups()}).catch(function(){})
+}
+function deleteList(i){
+  var name=groupListNames()[i],drafts=listDrafts(),draft=drafts.get(name);if(draft?.saving)return;
+  if(draft?.isNew){discardGroupSelection(i);return}
+  if(!confirm('Delete group list "'+name+'"?'))return;
+  delete S.cfg.groupLists[name];S.cfg.jobs.forEach(function(j){j.toLists=(j.toLists||[]).filter(function(n){return n!==name})});
+  saveData('Group list deleted.').then(function(){drafts.delete(name);listOpenPanels().delete(name);renderGroups()}).catch(function(){})
+}
+function toggleGroup(listIndex,groupIndex,on){
+  var name=groupListNames()[listIndex],group=(S.groups||[])[groupIndex];if(!group||name===undefined)return;
+  var drafts=listDrafts(),draft=drafts.get(name);
+  if(!draft){draft={groups:savedGroupsForList(name).slice(),isNew:false,saving:false,error:''};drafts.set(name,draft)}
+  if(draft.saving)return;
+  var index=draft.groups.indexOf(group.id);if(on&&index<0)draft.groups.push(group.id);if(!on&&index>=0)draft.groups.splice(index,1);
+  draft.error='';updateGroupSelectionUI(listIndex)
+}
+function updateGroupSelectionUI(i){
+  var name=groupListNames()[i],draft=listDrafts().get(name),selected=draft?draft.groups:savedGroupsForList(name),dirty=listSelectionDirty(name,draft);
+  document.getElementById('groupSelectionCount'+i).textContent=selected.length+' selected';
+  document.getElementById('groupSelectionState'+i).textContent=draft?.saving?'Saving...':draft?.isNew?'Not saved yet':dirty?'Unsaved changes':'All changes saved';
+  var button=document.getElementById('saveGroupList'+i);button.disabled=!!draft?.saving||!dirty||(!!draft?.isNew&&!selected.length);button.textContent=draft?.saving?'Saving...':'Save selected groups';
+  document.getElementById('discardGroupList'+i).disabled=!!draft?.saving||!draft;
+  document.getElementById('groupSelectionError'+i).textContent=draft?.error||''
+}
+function discardGroupSelection(i){
+  var name=groupListNames()[i],draft=listDrafts().get(name);if(draft?.saving)return;
+  listDrafts().delete(name);if(draft?.isNew)listOpenPanels().delete(name);
+  renderGroups();toast(draft?.isNew?'Draft list discarded.':'Unsaved selections discarded.')
+}
+function saveGroupSelection(i){
+  var name=groupListNames()[i],drafts=listDrafts(),draft=drafts.get(name),targetId=accountId;
+  if(!draft||draft.saving||!listSelectionDirty(name,draft))return;
+  if(draft.isNew&&!draft.groups.length){toast('Tick at least one group before saving the list.',true);return}
+  draft.saving=true;draft.error='';renderGroups();
+  return api('/api/accounts/'+encodeURIComponent(targetId)+'/group-lists/'+encodeURIComponent(name),'PUT',{groups:draft.groups.slice(),create:draft.isNew}).then(function(result){
+    drafts.delete(name);toast(result.message);
+    if(accountId===targetId){
+      S.cfg.groupLists=Object.assign(Object.create(null),S.cfg.groupLists,{[name]:result.groupList.groups});renderGroups();renderJobs();
+      return loadState().catch(function(){toast('Group list saved. Refresh the page to reload account data.',true)})
+    }
+  }).catch(function(e){draft.error=e.message;toast(e.message,true)}).finally(function(){draft.saving=false;if(accountId===targetId)renderGroups()})
+}
+function loadGroups(){
+  if(!accountId)return toast('Select an account first.',true);
+  var targetId=accountId;return api('/api/accounts/'+encodeURIComponent(targetId)+'/groups').then(function(d){if(accountId===targetId){S.groups=d.groups;renderGroups();toast('WhatsApp groups refreshed.')}}).catch(function(e){toast(e.message,true)})
+}
+function renderGroups(){
+  var drafts=listDrafts(),openPanels=listOpenPanels(),names=groupListNames();
+  if(renderedGroupAccountId===accountId)document.querySelectorAll('#listCards details[data-list-name]').forEach(function(panel){if(panel.open)openPanels.add(panel.dataset.listName);else openPanels.delete(panel.dataset.listName)});
+  renderedGroupAccountId=accountId;
+  document.getElementById('listCards').innerHTML=names.map(function(n,i){
+    var draft=drafts.get(n),selected=draft?draft.groups:savedGroupsForList(n),saved=savedGroupsForList(n),busy=!!draft?.saving;
+    return '<article class="card"><div class="row"><h3 class="grow">'+esc(n)+'</h3><span class="pill">'+(draft?.isNew?'New draft':saved.length+' saved')+'</span><button class="secondary" '+(busy?'disabled ':'')+'onclick="renameList('+i+')">Rename</button><button class="danger" '+(busy?'disabled ':'')+'onclick="deleteList('+i+')">'+(draft?.isNew?'Discard draft':'Delete')+'</button></div><details data-list-name="'+esc(n)+'" '+(openPanels.has(n)?'open':'')+'><summary>Choose groups</summary><p class="help">Tick or untick groups, then click Save selected groups. Checkbox changes are not saved automatically.</p><div class="groupbox">'+((S.groups||[]).map(function(g,j){return '<label><input type="checkbox" '+(selected.includes(g.id)?'checked ':'')+(busy?'disabled ':'')+'onchange="toggleGroup('+i+','+j+',this.checked)"> '+esc(g.subject)+'</label>'}).join('')||'<p class="muted">Connect this account and refresh WhatsApp groups to choose groups.</p>')+'</div><div class="row"><span id="groupSelectionCount'+i+'" class="pill">'+selected.length+' selected</span><span id="groupSelectionState'+i+'" class="muted"></span></div><div class="actions"><button id="saveGroupList'+i+'" onclick="saveGroupSelection('+i+')">Save selected groups</button><button id="discardGroupList'+i+'" class="secondary" onclick="discardGroupSelection('+i+')">Discard changes</button></div><p id="groupSelectionError'+i+'" class="form-feedback err" role="status" aria-live="polite"></p></details></article>'
+  }).join('')||'<p class="muted">Name a list, choose your groups, then save it.</p>';
+  names.forEach(function(name,i){updateGroupSelectionUI(i)});
+  document.getElementById('recipientCards').innerHTML=(S.cfg.recipients||[]).map(function(r,i){return '<div class="row"><b class="grow">'+esc(r.name||('Recipient '+(i+1)))+'</b><span>'+esc(r.phone.replace(/\d(?=\d{4})/g,'&bull;'))+'</span><button class="danger" onclick="removeRecipient(\''+esc(r.id)+'\')">Remove</button></div>'}).join('')||'<p class="muted">No individual numbers saved.</p>'
+}
 function addRecipient(){var phone=document.getElementById('recipientPhone').value.trim(),name=document.getElementById('recipientName').value.trim();if(!/^[+()\d\s.-]+$/.test(phone)||phone.replace(/\D/g,'').length<8||phone.replace(/\D/g,'').length>15){toast('Enter a valid number with country code.',true);return}api('/api/accounts/'+encodeURIComponent(accountId)+'/recipients','POST',{phone:phone,name:name}).then(function(){document.getElementById('recipientPhone').value='';document.getElementById('recipientName').value='';toast('Recipient added.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function removeRecipient(id){api('/api/accounts/'+encodeURIComponent(accountId)+'/recipients/'+encodeURIComponent(id),'DELETE').then(function(){toast('Recipient removed.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function jobFeedback(message,bad){var el=document.getElementById('jobFeedback');el.textContent=message;el.className='form-feedback'+(bad?' err':'');toast(message,bad)}
