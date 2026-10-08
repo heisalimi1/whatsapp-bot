@@ -500,7 +500,11 @@ function startDashboard() {
   app.get('/signup', (req, res) => sessionForRequest(req) ? res.redirect('/') : res.type('html').send(SIGNUP_PAGE))
   app.get('/forgot-password', (req, res) => res.type('html').send(FORGOT_PASSWORD_PAGE))
   app.get('/reset-password', (req, res) => res.type('html').send(RESET_PASSWORD_PAGE))
-  app.get('/', (req, res) => sessionForRequest(req) ? res.type('html').send(STAGE3_PAGE) : res.redirect('/login'))
+  app.get('/', (req, res) => {
+    if (!sessionForRequest(req)) return res.redirect('/login')
+    res.set('Cache-Control', 'no-store')
+    res.type('html').send(STAGE3_PAGE)
+  })
   const validEmail = value => typeof value === 'string' && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
   const validPassword = value => typeof value === 'string' && value.length >= 12 && Buffer.byteLength(value, 'utf8') <= 72
   const sameOrigin = req => !!req.get('origin') && req.get('origin') === `${req.protocol}://${req.get('host')}`

@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
+import vm from 'node:vm'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
@@ -83,16 +84,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   }))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
 
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = (input, init = {}) => {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 10000)
-    return originalFetch(input, { ...init, signal: controller.signal }).catch(error => {
-      if (controller.signal.aborted) throw new Error('HTTP smoke request timed out: ' + input)
-      throw error
-    }).finally(() => clearTimeout(timeout))
-  }
-  t.after(() => { globalThis.fetch = originalFetch })
+
   const base = `http://127.0.0.1:${port}`
   let app = launch(dir, port)
   t.after(context => {
@@ -221,7 +213,83 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const editedState = await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: proxyHeaders })).json()
   assert.deepEqual(editedState.cfg.messages.find(message => message.id === createdMessage.id).texts, ['Updated saved text'], 'message edits persist after reload')
 
-  const dashboardMarkup = await (await fetch(base, { headers: proxyHeaders, redirect: 'manual' })).text()
+  const dashboardResponse = await fetch(base, { headers: proxyHeaders, redirect: 'manual' })
+  assert.match(dashboardResponse.headers.get('cache-control') || '', /no-store/, 'the browser always receives the deployed dashboard script')
+  const dashboardMarkup = await dashboardResponse.text()
+  const dashboardScript = dashboardMarkup.match(/<script>([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(dashboardScript, 'the dashboard includes its interactive script')
+  new vm.Script(dashboardScript, { filename: 'dashboard-inline.js' })
+  const saveButtonMatch = dashboardMarkup.match(/<button onclick="([^"]+)">Save message<\/button>/)
+  assert.equal(saveButtonMatch?.[1], 'saveMessage()', 'the Messages page button calls the save handler')
+  const browserElements = new Map()
+  const browserElement = id => {
+    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, classList: { toggle() {} } })
+    return browserElements.get(id)
+  }
+  const saveButton = { disabled: false }
+  const browserRequests = []
+  const browserConsoleErrors = []
+  const browserFetch = (url, options = {}) => {
+    const target = new URL(String(url), base)
+    const headers = { ...(options.headers || {}), cookie: cookiePair, origin: 'https://127.0.0.1:' + port, 'x-forwarded-proto': 'https' }
+    browserRequests.push({ path: target.pathname, method: options.method || 'GET', csrf: headers['X-CSRF-Token'] || headers['x-csrf-token'] || '' })
+    return fetch(target, { ...options, headers })
+  }
+  const browserContext = vm.createContext({
+    document: {
+      getElementById: browserElement,
+      querySelector: () => saveButton,
+      querySelectorAll: () => [],
+      addEventListener() {},
+      activeElement: { tagName: 'BODY' },
+      hidden: false
+    },
+    window: { scrollTo() {} },
+    location: { assign() {} },
+    fetch: browserFetch,
+    console: { error: (...args) => browserConsoleErrors.push(args), warn() {}, log() {} },
+    setTimeout: () => 1,
+    clearTimeout() {},
+    setInterval: () => 1,
+    crypto: undefined,
+    URL,
+    Date,
+    Math,
+    JSON,
+    Promise,
+    Array,
+    String,
+    Number,
+    Object,
+    RegExp,
+    Error
+  })
+  new vm.Script(dashboardScript.slice(0, dashboardScript.indexOf("fetch('/api/session')")), { filename: 'dashboard-click-flow.js' }).runInContext(browserContext)
+  browserContext.accountId = accountIds[0]
+  browserContext.csrfToken = csrfToken
+  browserElement('messageName').value = 'testing'
+  browserElement('messageText').value = 'hi this is test message'
+  vm.runInContext(saveButtonMatch[1], browserContext)
+  const saveDeadline = Date.now() + 5000
+  while (saveButton.disabled && Date.now() < saveDeadline) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(saveButton.disabled, false, 'the Save Message click request completes')
+  assert.equal(browserConsoleErrors.length, 0, 'the dashboard click handler reports no browser console errors')
+  assert.equal(browserElement('toast').textContent, 'Message saved successfully.', 'the Messages page shows a clear success message')
+  assert(browserRequests.some(request => request.path === '/api/accounts/' + accountIds[0] + '/messages' && request.method === 'POST' && request.csrf), 'the button sends an authenticated, CSRF-protected create request')
+  assert.match(browserElement('messageCards').innerHTML, /<h3>testing<\/h3>/, 'the new message appears in the saved messages list')
+  const testingMessage = browserContext.S.cfg.messages.find(message => message.name === 'testing' && message.texts.includes('hi this is test message'))
+  assert(testingMessage, 'the saved message is returned to the page after the request')
+  const persistedAutomation = JSON.parse(fs.readFileSync(path.join(accountRoot, accountIds[0], 'automation.json'), 'utf8'))
+  assert(persistedAutomation.messages.some(message => message.id === testingMessage.id && message.name === 'testing' && message.texts.includes('hi this is test message')), 'the exact test message is persisted to disk')
+  const serverLog = await (await fetch(base + '/api/log', { headers: proxyHeaders })).json()
+  assert.doesNotMatch(serverLog.log, /Unable to (create|update) account message/, 'the server reports no message-save error')
+  assert(browserElement('jobMessage').innerHTML.includes('value="' + testingMessage.id + '">testing</option>'), 'the saved message appears in the Automations dropdown')
+  browserElement('jobMessage').value = testingMessage.id
+  assert.equal(browserElement('jobMessage').value, testingMessage.id, 'the Automations dropdown can select the saved message')
+  await vm.runInContext('loadState()', browserContext)
+  assert(browserContext.S.cfg.messages.some(message => message.id === testingMessage.id), 'the message remains after refreshing account state')
+  assert(browserElement('messageCards').innerHTML.includes('<h3>testing</h3>'), 'the message remains in the list after refreshing')
+  assert(browserElement('jobMessage').innerHTML.includes('value="' + testingMessage.id + '">testing</option>'), 'the refreshed Automations dropdown retains the saved message')
   assert.match(dashboardMarkup, /messageSelect\.innerHTML=\(S\.cfg\.messages\|\|\[\]\)\.map/, 'Automations renders saved account messages as selectable options')
   assert(dashboardMarkup.includes("var target='/api/accounts/'+encodeURIComponent(accountId)+'/messages'"), 'Save Message uses the account-scoped message API')
 
