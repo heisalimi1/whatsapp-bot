@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { recoverInterruptedJob, parseSchedule, intervalMilliseconds, nextIntervalRun, createDeliveryRun, dispatchDeliveryRun, runMetrics } from '../recurring-schedules.js'
+import { validSendingDelays, recoverInterruptedJob, parseSchedule, intervalMilliseconds, nextIntervalRun, createDeliveryRun, dispatchDeliveryRun, runMetrics } from '../recurring-schedules.js'
 
 test('restart recovery resumes recurring work and preserves explicitly paused schedules', () => {
   for (const cadence of [{ interval: { value: 2, unit: 'hours' } }, { cron: '* * * * *' }]) {
@@ -16,6 +16,8 @@ test('restart recovery resumes recurring work and preserves explicitly paused sc
 
 test('custom minutes/hours/days stay anchored and coalesce missed intervals', () => {
   const now = Date.parse('2026-10-08T12:00:00Z')
+  for (const seconds of [0,300,7200,172800,365*86400]) assert(validSendingDelays([seconds,seconds]))
+  for (const delays of [[-1,-1],[0,601],[600,0],[Infinity,Infinity],[NaN,NaN],[366*86400,366*86400]]) assert.equal(validSendingDelays(delays),false)
   for (const [unit, value, ms] of [['minutes',17,1020000],['hours',3,10800000],['days',2,172800000]]) {
     const config = parseSchedule({ interval: { value, unit } }, now)
     assert.equal(Date.parse(config.nextRunAt), now + ms)

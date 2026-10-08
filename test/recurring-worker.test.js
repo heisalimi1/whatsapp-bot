@@ -18,7 +18,7 @@ function worker(data, clock, calls) {
     setTimeout(fn,ms){const id=++nextTimer;timers.set(id,{fn,at:clock.now+ms});return id},clearTimeout(id){timers.delete(id)},
     async dataFor(){return data},saveAccountData(){persisted=JSON.parse(JSON.stringify(data))},
     async getAccountSocket(){return online?{async sendMessage(jid,content,options){calls.push({jid,content,options})}}:null},
-    async getAccountStatusAudience(){return ['1234567890@s.whatsapp.net']},async targetsFor(){return [{jid:'fixture@g.us'}]},
+    async getAccountStatusAudience(){return ['1234567890@s.whatsapp.net']},async targetsFor(){return data.fixtureTargets || [{jid:'fixture@g.us'}]},
     pickText(message){return message.texts[0]},buildContent(entry,text){return entry.media?{image:Buffer.from('fixture'),caption:text}:{text}},async waitBetweenSends(){}
   })
   vm.runInContext(functions,context)
@@ -44,4 +44,23 @@ test('background worker repeats, coalesces downtime, survives restart and preven
   assert.equal(restarted.timers.size,1,'offline waits have one bounded retry timer')
   restarted.online();await restarted.advance(30000);assert.equal(calls.length,10,'a saved schedule resumes after connectivity returns')
   snapshot.jobs=[];restarted.arm();await restarted.advance(60000);assert.equal(calls.length,10,'deleting a schedule stops future deliveries')
+})
+
+test('each group has its own persisted sending interval, independent of campaign repetition', async()=>{
+  const clock={now:Date.parse('2026-10-08T12:00:00Z')},calls=[]
+  const data={fixtureTargets:[{jid:'one@g.us'},{jid:'two@g.us'},{jid:'three@g.us'}],jobs:[{id:'job',messageId:'message',interval:{value:2,unit:'hours'},nextRunAt:new Date(clock.now).toISOString(),status:'scheduled',repeatCount:1,delaySeconds:[300,300],toLists:['fixture'],toRecipients:[],toStatus:false}],messages:[{id:'message',texts:['fixture']}],delaySeconds:[0,0]}
+  const first=worker(data,clock,calls);first.arm();await first.advance(0)
+  assert.deepEqual(calls.map(c=>c.jid),['one@g.us']);assert.equal(data.jobs[0].progress,1)
+  assert.equal(data.jobs[0].activeRun.nextDeliveryAt,'2026-10-08T12:05:00.000Z')
+  assert.equal(first.context.runningJobs.size,0,'a long wait releases the worker slot')
+  const saved=first.snapshot(),restarted=worker(saved,clock,calls);restarted.arm()
+  await restarted.advance(299000);assert.equal(calls.length,1,'restart keeps the remaining wait before Group 2')
+  await restarted.advance(1000);assert.deepEqual(calls.map(c=>c.jid),['one@g.us','two@g.us'])
+  saved.jobs[0].status='paused';restarted.arm();await restarted.advance(60000);assert.equal(calls.length,2)
+  saved.jobs[0].status='scheduled';restarted.arm();await restarted.advance(239000);assert.equal(calls.length,2)
+  await restarted.advance(1000);assert.deepEqual(calls.map(c=>c.jid),['one@g.us','two@g.us','three@g.us'])
+  assert.equal(saved.jobs[0].nextRunAt,'2026-10-08T14:00:00.000Z','group gaps do not replace the full campaign repeat interval')
+  const long={...saved,jobs:[{...saved.jobs[0],activeRun:null,lastOccurrenceAt:'',nextRunAt:new Date(clock.now).toISOString(),delaySeconds:[86400,86400]}]}
+  const days=worker(long,clock,[]);days.arm();await days.advance(0)
+  assert.equal(Date.parse(long.jobs[0].activeRun.nextDeliveryAt),clock.now+86400000,'day gaps use persisted deadlines rather than a blocking sleep')
 })

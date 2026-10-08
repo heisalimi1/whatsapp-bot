@@ -4,6 +4,9 @@ import { sendDelivery } from './automation-delivery.js'
 
 const units = { minutes: 60000, hours: 3600000, days: 86400000 }
 export const recurring = job => !!(job.interval || job.cron)
+export function validSendingDelays(delays) {
+  return Array.isArray(delays) && delays.length === 2 && delays.every(Number.isFinite) && delays[0] >= 0 && delays[1] >= delays[0] && delays[1] <= (delays[0] === delays[1] ? 365 * 86400 : 600)
+}
 export function recoverInterruptedJob(job) {
   if (job.status !== 'running') return false
   job.status = recurring(job) ? 'scheduled' : 'paused'
@@ -41,22 +44,29 @@ export function runMetrics(run) {
   return { progress: run.entries.filter(e => !['pending', 'attempting'].includes(e.state)).length, total: run.entries.length, failedCount: run.entries.filter(e => ['failed', 'uncertain'].includes(e.state)).length, uncertainCount: run.entries.filter(e => e.state === 'uncertain').length }
 }
 /** Persist intent before dispatch. Unconfirmed attempts are never replayed automatically. */
-export async function dispatchDeliveryRun({ run, socket, contentFor, save, shouldStop = () => false, onProgress = () => {}, wait = async () => {} }) {
+export async function dispatchDeliveryRun({ run, socket, contentFor, save, shouldStop = () => false, onProgress = () => {}, wait = async () => {}, nextDelay, now = Date.now }) {
   for (let index = 0; index < run.entries.length; index++) {
     if (shouldStop()) return { stopped: true }
     const entry = run.entries[index]
-    if (entry.state === 'attempting') { entry.state = 'uncertain'; onProgress(); await save() }
+    if (entry.state === 'attempting') {
+      entry.state = 'uncertain'
+      if (nextDelay && !run.nextDeliveryAt) run.nextDeliveryAt = new Date(now() + nextDelay()).toISOString()
+      onProgress(); await save()
+    }
     if (entry.state !== 'pending') continue
+    if (nextDelay && Date.parse(run.nextDeliveryAt || '') > now()) return { stopped: false, deferredUntil: run.nextDeliveryAt }
     let content
     try { content = contentFor(entry) } catch { entry.state = 'failed'; onProgress(); await save(); continue }
     entry.state = 'attempting'
+    if (nextDelay) run.nextDeliveryAt = ''
     await save()
     if (shouldStop()) { entry.state = 'pending'; await save(); return { stopped: true } }
     try { await sendDelivery(socket, entry.delivery, content, { messageId: entry.messageId }); entry.state = 'sent' }
     catch { entry.state = 'uncertain' }
+    if (nextDelay && index < run.entries.length - 1) run.nextDeliveryAt = new Date(now() + nextDelay()).toISOString()
     onProgress()
     await save()
-    if (index < run.entries.length - 1) await wait()
+    if (!nextDelay && index < run.entries.length - 1) await wait()
   }
   return { stopped: shouldStop() }
 }

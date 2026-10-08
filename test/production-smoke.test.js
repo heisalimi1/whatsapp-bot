@@ -434,7 +434,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const intervalJobs = []
   for (const [value, unit] of [[17,'minutes'],[3,'hours'],[2,'days']]) {
     const created = await fetch(`${base}/api/accounts/${accountIds[0]}/jobs`, { method:'POST', headers:messageHeaders,
-      body:JSON.stringify({name:'Custom '+unit,messageId:unit==='hours'?mediaMessage.id:unit==='days'?videoMessage.id:testingMessage.id,toStatus:true,toLists:[],toRecipients:[],repeatCount:1,delaySeconds:[0,0],interval:{value,unit}}) })
+      body:JSON.stringify({name:'Custom '+unit,messageId:unit==='hours'?mediaMessage.id:unit==='days'?videoMessage.id:testingMessage.id,toStatus:true,toLists:[],toRecipients:[],repeatCount:1,delaySeconds:unit==='hours'?[7200,7200]:unit==='days'?[86400,86400]:[300,300],interval:{value,unit}}) })
     assert.equal(created.status,201)
     const job=(await created.json()).job;intervalJobs.push(job)
     assert.deepEqual(job.interval,{value,unit});assert(Date.parse(job.nextRunAt)>Date.now())
