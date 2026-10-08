@@ -65,11 +65,35 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
     await command('Runtime.enable')
     await command('Network.enable')
     await command('Page.enable')
+    const layoutProblems = []
+    const checkPageWidth = async (label, prepare = '') => {
+      const layout = await evaluate('(()=>{' + prepare + ';return {viewport:document.documentElement.clientWidth,page:document.documentElement.scrollWidth}})()')
+      if (layout.page > layout.viewport) layoutProblems.push({ label, ...layout })
+    }
+    for (const route of ['/login', '/signup', '/forgot-password', '/reset-password']) {
+      await command('Page.navigate', { url: base + route })
+      await waitFor(() => evaluate('location.pathname===' + JSON.stringify(route) + '&&!!document.getElementById("form")'), 'The authentication page did not load: ' + route)
+      for (const width of [320, 360, 390, 768, 1365]) {
+        await command('Emulation.setDeviceMetricsOverride', { width, height: 700, deviceScaleFactor: 1, mobile: width < 600 })
+        await checkPageWidth(route + ' at ' + width + 'px', 'document.getElementById("message").textContent=""')
+        await checkPageWidth(route + ' with a long response at ' + width + 'px', 'document.getElementById("message").textContent="LayoutTest".repeat(40)')
+        assert(await evaluate('[...document.querySelectorAll("input,button,.links a")].every(el=>{const r=el.getBoundingClientRect();return r.left>=0&&r.right<=document.documentElement.clientWidth+1})'), 'authentication controls remain fully visible at ' + width + 'px')
+      }
+    }
     const equals = cookie.indexOf('=')
     await command('Network.setCookie', { name: cookie.slice(0, equals), value: cookie.slice(equals + 1), url: base, httpOnly: true, secure: false })
     await command('Emulation.setDeviceMetricsOverride', { width: 1365, height: 1000, deviceScaleFactor: 1, mobile: false })
     await command('Page.navigate', { url: base })
     await waitFor(() => evaluate('typeof S !== "undefined" && S && !!S.cfg && S.selectedAccountId === ' + JSON.stringify(accountId)), 'The authenticated dashboard did not load.')
+    for (const width of [320, 360, 390, 768, 1365]) {
+      await command('Emulation.setDeviceMetricsOverride', { width, height: 700, deviceScaleFactor: 1, mobile: width < 600 })
+      for (const view of ['overview', 'accounts', 'messages', 'groups', 'jobs', 'settings']) {
+        await checkPageWidth(view + ' at ' + width + 'px', 'showView(' + JSON.stringify(view) + ');document.getElementById("overviewLog").textContent="LayoutTest".repeat(100)')
+      }
+      await checkPageWidth('notification at ' + width + 'px', 'toast("LayoutTest".repeat(100))')
+    }
+    await evaluate('document.getElementById("toast").style.display="none"')
+    assert.deepEqual(layoutProblems, [], 'entry pages and long activity lines must fit the viewport')
     await evaluate('showView("accounts");document.getElementById("newAccountPhone").value="+123 456 789 012 345"')
     for (const width of [320, 360, 390, 768, 1365]) {
       await command('Emulation.setDeviceMetricsOverride', { width, height: 900, deviceScaleFactor: 1, mobile: width < 600 })
