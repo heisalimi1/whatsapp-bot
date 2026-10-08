@@ -36,6 +36,9 @@ export function buildDeliveryPlan(targets, statusRecipients, job, repeat) {
 }
 
 export function sendDelivery(socket, delivery, content, options) {
-  if (delivery.kind === 'status') return socket.sendMessage(delivery.jid, content, { ...options, statusJidList: delivery.statusJidList })
+  if (delivery.kind === 'status') {
+    const textStyle = typeof content.text === 'string' ? { backgroundColor: '#008069', font: 1 } : {}
+    return socket.sendMessage(delivery.jid, content, { ...textStyle, ...options, statusJidList: delivery.statusJidList })
+  }
   return options ? socket.sendMessage(delivery.jid, content, options) : socket.sendMessage(delivery.jid, content)
 }

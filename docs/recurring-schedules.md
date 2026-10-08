@@ -2,6 +2,8 @@
 
 In Automations, choose a saved message, select Groups, WhatsApp Status, Contacts, or a combination, then choose **Repeat at intervals**. Enter a whole number and select minutes, hours, or days. Text, uploaded images, and uploaded videos use the existing message/media controls. Status viewers come from the connected account's synced contacts; no manual viewer numbers are required. WhatsApp privacy rules still determine visibility.
 
+Text-only Status posts use an opaque green/teal background (`#008069`) and WhatsApp's system text font. These style options apply only to text Status, preserving ordinary messages and image/video content.
+
 Status eligibility uses the PN/LID pairs in the authenticated contact snapshot before consulting Baileys' mapping cache. Missing mappings are resolved in bounded batches. An unrelated unmapped blocked/excluded identifier does not stop all eligible viewers: contacts whose eligibility cannot be verified are withheld individually. Custom allow lists stay restrictive and blocked/excluded contacts remain excluded across aliases. The Sync WhatsApp contacts button verifies the audience and reports eligible viewers; the authenticated preview endpoint returns counts only, never contact identifiers. Previewing does not publish a Status.
 
 One-time jobs that failed before any delivery plan or send offer **Retry**. They are not automatically replayed: multiple failed attempts might represent the same intended Status. Jobs with partial or unconfirmed delivery retain the existing progress-aware controls instead of a fresh-run Retry button.

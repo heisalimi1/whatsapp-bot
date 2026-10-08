@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { normalizeDestinations, buildDeliveryPlan, sendDelivery } from '../automation-delivery.js'
 import { StatusAudience } from '../status-audience.js'
+import { generateWAMessageContent } from '@whiskeysockets/baileys'
 
 const viewers = ['12345678901', '12345678902']
 const group = { jid: 'test-group@g.us', name: 'Test group' }
@@ -85,4 +86,22 @@ test('delivery planning prevents empty audiences, unresolved groups and exceedin
 test('send failures propagate to the worker for error accounting', async () => {
   const socket = { async sendMessage() { throw new Error('test-send-failed') } }
   await assert.rejects(() => sendDelivery(socket, { kind: 'status', jid: 'status@broadcast', statusJidList: [] }, { text: 'test' }), /test-send-failed/)
+})
+
+test('text Status uses an opaque teal background and native text font in actual Baileys serialization', async () => {
+  const calls = [], delivery = { kind: 'status', jid: 'status@broadcast', statusJidList: viewers.map(n => n + '@s.whatsapp.net') }
+  const content = { text: 'Status color fixture' }, options = { messageId: 'FIXTURE-MESSAGE-ID' }
+  const socket = { async sendMessage(...args) { calls.push(args); return generateWAMessageContent(args[1], args[2]) } }
+  const message = await sendDelivery(socket, delivery, content, options)
+  assert.equal(message.extendedTextMessage.backgroundArgb, 0xff008069, 'full opacity prevents a transparent/black Status background')
+  assert.equal(message.extendedTextMessage.font, 1)
+  assert.equal(message.extendedTextMessage.text, content.text)
+  assert.deepEqual(calls[0][2], { backgroundColor: '#008069', font: 1, ...options, statusJidList: delivery.statusJidList })
+  assert.deepEqual(options, { messageId: 'FIXTURE-MESSAGE-ID' }, 'caller options are preserved')
+  const otherCalls = [], capture = { async sendMessage(...args) { otherCalls.push(args) } }
+  await sendDelivery(capture, { kind: 'message', jid: group.jid }, content, options)
+  await sendDelivery(capture, delivery, { image: Buffer.from('fixture'), caption: 'caption' }, options)
+  await sendDelivery(capture, delivery, { video: Buffer.from('fixture'), caption: 'caption' }, options)
+  assert.equal(otherCalls[0][2], options)
+  for (const [, , sendOptions] of otherCalls) { assert.equal(sendOptions.backgroundColor, undefined); assert.equal(sendOptions.font, undefined) }
 })
