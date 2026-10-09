@@ -5,7 +5,10 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "test": "node --test"
+    "test": "node --test",
+    "sandbox": "node scripts/local-command-sandbox.js start",
+    "sandbox:status": "node scripts/local-command-sandbox.js status",
+    "sandbox:stop": "node scripts/local-command-sandbox.js stop"
   },
   "keywords": [],
   "author": "",
@@ -18,8 +21,10 @@
     "@whiskeysockets/baileys": "^7.0.0-rc14",
     "bcryptjs": "^3.0.3",
     "express": "^5.1.0",
+    "ffmpeg-static": "5.3.0",
     "node-cron": "^4.6.0",
     "nodemailer": "^10.0.16",
-    "pino": "^10.4.0"
+    "pino": "^10.4.0",
+    "sharp": "0.35.5"
   }
 }

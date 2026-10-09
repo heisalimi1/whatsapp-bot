@@ -1,0 +1,40 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectToWhatsAppBotOnly",
+      "Effect": "Allow",
+      "Action": "ssm:StartSession",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:715975222545:instance/i-07e90b2538d64c784",
+        "arn:aws:ssm:us-east-2::document/AWS-StartSSHSession",
+        "arn:aws:ssm:us-east-2::document/SSM-SessionManagerRunShell",
+        "arn:aws:ssm:us-east-2:715975222545:document/SSM-SessionManagerRunShell"
+      ]
+    },
+    {
+      "Sid": "CheckManagedInstance",
+      "Effect": "Allow",
+      "Action": ["ssm:DescribeInstanceInformation", "ec2:DescribeInstances"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CheckBotConnection",
+      "Effect": "Allow",
+      "Action": "ssm:GetConnectionStatus",
+      "Resource": "arn:aws:ec2:us-east-2:715975222545:instance/i-07e90b2538d64c784"
+    },
+    {
+      "Sid": "OwnIAMUserSessions",
+      "Effect": "Allow",
+      "Action": ["ssmmessages:OpenDataChannel", "ssm:TerminateSession", "ssm:ResumeSession"],
+      "Resource": "arn:aws:ssm:us-east-2:715975222545:session/${aws:username}-*"
+    },
+    {
+      "Sid": "OwnFederatedSessions",
+      "Effect": "Allow",
+      "Action": ["ssmmessages:OpenDataChannel", "ssm:TerminateSession", "ssm:ResumeSession"],
+      "Resource": "arn:aws:ssm:us-east-2:715975222545:session/${aws:userid}-*"
+    }
+  ]
+}

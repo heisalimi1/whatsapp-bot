@@ -45,6 +45,34 @@ function fixture(t, overrides = {}) {
   return { root, auth, sockets, authPaths, make }
 }
 
+test('command event listeners attach once, detach on disconnect, and ignore replaced sockets', async t => {
+  const f = fixture(t), manager = f.make(), events = []
+  manager.onAccountEvent((socket, id, name, update) => events.push({ socket, id, name, update }))
+  await manager.listAccounts(owner); await until(() => f.sockets.length === 1)
+  const first = f.sockets[0]
+  first.ev.emit('messages.upsert', { type: 'notify', messages: [] })
+  await delay(5); assert.equal(events.length, 0, 'Unconnected sockets do not route commands')
+  first.ev.emit('connection.update', { connection: 'open' })
+  first.ev.emit('connection.update', { connection: 'open' })
+  assert.equal(first.ev.listenerCount('messages.upsert'), 1)
+  assert.equal(first.ev.listenerCount('group-participants.update'), 1)
+  first.ev.emit('messages.upsert', { type: 'notify', messages: [] })
+  first.ev.emit('group-participants.update', { action: 'add', participants: [] })
+  await until(() => events.length === 2)
+  assert(events.every(event => event.socket === first && event.id === accountId))
+  await manager.disconnectAccount(accountId)
+  assert.equal(first.ev.listenerCount('messages.upsert'), 0)
+  assert.equal(first.ev.listenerCount('group-participants.update'), 0)
+  await manager.reconnectAccount(accountId)
+  const second = f.sockets[1]; second.ev.emit('connection.update', { connection: 'open' })
+  first.ev.emit('messages.upsert', { type: 'notify', messages: [] })
+  second.ev.emit('messages.upsert', { type: 'notify', messages: [] })
+  await until(() => events.length === 3)
+  assert.equal(events[2].socket, second)
+  assert.equal(second.ev.listenerCount('messages.upsert'), 1)
+  assert.equal(fs.readFileSync(path.join(f.auth, 'session-marker'), 'utf8'), 'original-session-fixture')
+})
+
 test('all devices reuse one registered socket; stale socket events cannot disconnect its replacement', async t => {
   const f=fixture(t),manager=f.make()
   await manager.listAccounts(owner)

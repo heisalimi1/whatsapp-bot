@@ -8,6 +8,7 @@ import vm from 'node:vm'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { checkDashboardBrowser } from '../test-support/dashboard-browser.js'
+import { createCommandStore } from '../commands/store.js'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const accountIds = ['11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222']
@@ -75,7 +76,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const accountRoot = path.join(dir, 'accounts')
   for (const id of accountIds) fs.mkdirSync(path.join(accountRoot, id), { recursive: true })
   fs.writeFileSync(path.join(accountRoot, accountIds[0], 'groups.json'), JSON.stringify({
-    groups: [{ id: 'test-group@g.us', subject: 'Shared test group' }], syncedAt: now
+    groups: [{ id: '120363000000000001@g.us', subject: 'Shared test group' }], syncedAt: now
   }))
   fs.mkdirSync(path.join(accountRoot, accountIds[0], 'auth'), { recursive: true })
   fs.writeFileSync(path.join(accountRoot, accountIds[0], 'auth', 'migration-fixture'), 'test-only-session-fixture')
@@ -193,7 +194,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     const data = {
       timezone: 'Africa/Lagos', delaySeconds: [0, 0], statusRecipients: [],
       recipients: label === 'A' ? [{ id: recipientId, name: 'Recipient A', phone: '2348012345678' }] : [],
-      groupLists: { [`${label} list`]: ['test-group@g.us'] },
+      groupLists: { [`${label} list`]: ['120363000000000001@g.us'] },
       messages: [{ id: messageId, name: label, texts: [`private ${label}`], media: '' }], jobs: []
     }
     const result = await fetch(`${base}/api/accounts/${id}/data`, {
@@ -207,6 +208,18 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   await putAccount(accountIds[0], 'A')
   await putAccount(accountIds[1], 'B')
   const messageHeaders = { ...proxyHeaders, origin: 'https://127.0.0.1:' + port, 'x-csrf-token': csrfToken, 'content-type': 'application/json' }
+  const commandUrl = base + '/api/accounts/' + accountIds[0] + '/commands'
+  assert.equal((await fetch(commandUrl)).status, 401, 'command settings require dashboard authentication')
+  const initialCommands = await (await fetch(commandUrl, { headers: messageHeaders })).json()
+  assert.equal(initialCommands.catalog.length, 23)
+  assert(initialCommands.catalog.filter(c => c.category !== 'Basic').every(c => !initialCommands.config.commands[c.name].enabled))
+  assert.equal((await fetch(commandUrl, { method: 'PUT', headers: { cookie: cookiePair, 'content-type': 'application/json' }, body: JSON.stringify(initialCommands) })).status, 403, 'command writes require origin and CSRF validation')
+  assert.equal((await fetch(commandUrl, { method: 'PUT', headers: messageHeaders, body: JSON.stringify({ config: initialCommands.config, revision: initialCommands.revision + 1 }) })).status, 409, 'stale command settings cannot overwrite current data')
+  const unknown = structuredClone(initialCommands.config); unknown.commands['not-a-command'] = { enabled: true, permission: 'owner' }
+  assert.equal((await fetch(commandUrl, { method: 'PUT', headers: messageHeaders, body: JSON.stringify({ config: unknown, revision: initialCommands.revision }) })).status, 400, 'unknown commands cannot be configured')
+  const foreignRecipients = structuredClone(initialCommands.config); foreignRecipients.broadcast.lists.Foreign = ['99999999-9999-4999-8999-999999999999']
+  assert.equal((await fetch(commandUrl, { method: 'PUT', headers: messageHeaders, body: JSON.stringify({ config: foreignRecipients, revision: initialCommands.revision }) })).status, 400, 'broadcast lists require existing recipients from this account')
+  assert.equal((await fetch(commandUrl + '/groups/' + encodeURIComponent('120363000000009999@g.us'), { method: 'PUT', headers: messageHeaders, body: JSON.stringify({ config: {}, revision: initialCommands.revision }) })).status, 404, 'group settings cannot target another account’s groups')
   for (let attempt = 0; attempt < 310; attempt++) {
     const invalid = await fetch(base + '/api/accounts', { method: 'POST', headers: messageHeaders, body: JSON.stringify({ phone: 'invalid-fixture' }) })
     assert.equal(invalid.status, 400, 'connection attempts have no account creation or blanket API cooldown')
@@ -245,7 +258,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const selectedBrowserLists = [{ value: 'A list', checked: true }]
   const selectedBrowserContacts = [{ value: recipientId, checked: true }]
   const browserElement = id => {
-    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, checked: false, classList: { toggle() {}, add() {}, remove() {} } })
+    if (!browserElements.has(id)) browserElements.set(id, { id, value: '', textContent: '', innerHTML: '', className: '', style: {}, disabled: false, checked: false, addEventListener() {}, contains() { return false }, classList: { toggle() {}, add() {}, remove() {} } })
     return browserElements.get(id)
   }
   const saveButton = { disabled: false }
@@ -424,13 +437,16 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const secondCookie = secondLogin.headers.get('set-cookie').split(';')[0]
   assert.notEqual(secondCookie, cookiePair, 'each device has an independent dashboard session')
   const secondState = await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: { cookie: secondCookie } })).json()
-  assert.deepEqual(secondState.groups, [{ id: 'test-group@g.us', subject: 'Shared test group' }])
+  assert.deepEqual(secondState.groups, [{ id: '120363000000000001@g.us', subject: 'Shared test group' }])
   assert.equal(secondState.account.status, (await (await fetch(base + '/api/state?accountId=' + accountIds[0], { headers: proxyHeaders })).json()).account.status)
+  const commandFixtureStore = createCommandStore(path.join(dir, 'auth.sqlite'))
+  commandFixtureStore.warn(firstUser.id, accountIds[0], '120363000000000001@g.us', '15105550102@s.whatsapp.net')
+  commandFixtureStore.close()
   const checkedBrowser = await checkDashboardBrowser({
     base, cookie: cookiePair, secondCookie, accountId: accountIds[0], messageId: testingMessage.id,
     screenshotDir: process.env.DASHBOARD_TEST_SCREENSHOTS
   })
-  t.diagnostic(checkedBrowser ? 'Real Chromium: separate/combined destinations, refresh, desktop/mobile layouts and console passed.' : 'Real Chromium unavailable; HTTP and dashboard handler coverage passed.')
+  t.diagnostic(checkedBrowser ? 'Real Chromium: Bot Commands, settings/group rules, warning reset, concurrent edits, device synchronization, destinations, refresh, responsive layouts and console passed.' : 'Real Chromium unavailable; HTTP and dashboard handler coverage passed.')
   const mediaUpload = await fetch(base + '/api/upload', {
     method: 'POST', headers: messageHeaders,
     body: JSON.stringify({ accountId: accountIds[0], name: 'message-test.png', data: 'iVBORw0KGgo=' })
@@ -498,6 +514,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}`, { headers: userBHeaders })).status, 404)
   assert.equal((await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: userBHeaders })).status, 404)
   assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/groups`, { headers: userBHeaders })).status, 404)
+  assert.equal((await fetch(commandUrl, { headers: userBHeaders })).status, 404, 'command settings enforce business account ownership')
   assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/status/preview`, { headers: userBHeaders })).status, 404, 'Status privacy preview enforces business ownership')
   response = await fetch(`${base}/api/upload`, {
     method: 'POST', headers: { ...userBHeaders, 'content-type': 'application/json', origin: base },
@@ -520,6 +537,11 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const sharedState = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: userBHeaders })).json()
   assert.equal(sharedState.workspace.id, ownerSession.workspace.id)
   assert.equal(sharedState.workspace.role, 'member')
+  const ownerCommands = await (await fetch(commandUrl, { headers: messageHeaders })).json()
+  const memberCommands = await (await fetch(commandUrl, { headers: userBHeaders })).json()
+  assert.deepEqual(memberCommands.config, ownerCommands.config, 'authorized business members see synchronized command settings')
+  assert.equal((await fetch(commandUrl, { method: 'PUT', headers: teamHeaders, body: JSON.stringify({ config: memberCommands.config, revision: memberCommands.revision }) })).status, 403, 'members cannot enable commands or change owner permissions')
+  assert.equal((await fetch(commandUrl + '/groups/' + encodeURIComponent('120363000000000001@g.us') + '/warnings/' + encodeURIComponent('15105550102@s.whatsapp.net'), { method: 'DELETE', headers: teamHeaders })).status, 403, 'only business owners can reset member warnings')
   assert.deepEqual(sharedState.cfg, finalRefreshedState.cfg, 'authorized members share messages, jobs, lists and recipients')
   assert.deepEqual(sharedState.groups, secondState.groups, 'authorized members share the persistent group snapshot')
   assert.equal((await fetch(base + '/api/workspace/invites', { method: 'POST', headers: teamHeaders, body: JSON.stringify({ email: 'other@example.test' }) })).status, 403)
@@ -530,11 +552,11 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal(response.status, 409, 'stale browser data cannot overwrite another device edits')
   response = await fetch(`${base}/api/accounts/${accountIds[0]}/data`, {
     method: 'PUT', headers: teamHeaders,
-    body: JSON.stringify({ ...sharedState.cfg, groupLists: { ...sharedState.cfg.groupLists, 'Shared member list': ['test-group@g.us'] } })
+    body: JSON.stringify({ ...sharedState.cfg, groupLists: { ...sharedState.cfg.groupLists, 'Shared member list': ['120363000000000001@g.us'] } })
   })
   assert.equal(response.status, 200)
   const sharedRefresh = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: proxyHeaders })).json()
-  assert.deepEqual(sharedRefresh.cfg.groupLists['Shared member list'], ['test-group@g.us'], 'member saves are visible to the owner')
+  assert.deepEqual(sharedRefresh.cfg.groupLists['Shared member list'], ['120363000000000001@g.us'], 'member saves are visible to the owner')
   delete sharedRefresh.cfg.groupLists['Shared member list']
   assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/data`, { method: 'PUT', headers: messageHeaders, body: JSON.stringify(sharedRefresh.cfg) })).status, 200)
   response = await fetch(base + '/api/workspace/members/' + memberSession.user.id, { method: 'DELETE', headers: messageHeaders })
@@ -602,6 +624,9 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const restartCookie = loginAgain.headers.get('set-cookie').split(';')[0]
   const restartedA = await (await fetch(`${base}/api/state?accountId=${accountIds[0]}`, { headers: { cookie: restartCookie } })).json()
   const restartedB = await (await fetch(`${base}/api/state?accountId=${accountIds[1]}`, { headers: { cookie: restartCookie } })).json()
+  const restartedCommands = await (await fetch(commandUrl, { headers: { cookie: restartCookie } })).json()
+  assert.deepEqual(restartedCommands.config, ownerCommands.config, 'command settings survive a backend restart')
+  assert.deepEqual(restartedCommands.groups, ownerCommands.groups, 'group rules and warning counts survive a backend restart')
   assert.equal(restartedA.cfg.messages[0].texts[0], 'private A')
   for(const job of intervalJobs)assert(restartedA.cfg.jobs.some(saved=>saved.id===job.id&&saved.interval?.unit===job.interval.unit&&saved.nextRunAt),'custom recurring schedules and next run times survive restart')
   assert.deepEqual(restartedA.groups, secondState.groups, 'saved WhatsApp groups remain available after a backend restart')

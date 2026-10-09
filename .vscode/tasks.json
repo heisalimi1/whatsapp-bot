@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "AWS: Sign in",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/ssm-workflow.js", "login"],
+      "problemMatcher": []
+    },
+    {
+      "label": "AWS: Verify Session Manager",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/ssm-workflow.js", "check"],
+      "problemMatcher": []
+    },
+    {
+      "label": "AWS: Open EC2 terminal through SSM",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/ssm-workflow.js", "connect"],
+      "problemMatcher": []
+    },
+    {
+      "label": "AWS: Verify deployment access (no restart)",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/ssm-workflow.js", "preflight"],
+      "problemMatcher": []
+    },
+    {
+      "label": "AWS: Back up production data (no restart)",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/ssm-workflow.js", "backup"],
+      "problemMatcher": []
+    },
+    {
+      "label": "AWS: Deploy pushed main through SSM (restarts bot)",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/ssm-workflow.js", "deploy"],
+      "problemMatcher": []
+    }
+  ]
+}

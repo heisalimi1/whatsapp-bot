@@ -16,6 +16,7 @@ process.umask(0o077)
 const entries = new Map()
 let initPromise
 let connectionListener = () => {}
+let eventListener = () => {}
 let stopping = false
 
 function now() { return new Date().toISOString() }
@@ -59,6 +60,8 @@ async function endSocket(entry, { logout = false } = {}) {
   entry.cancelPair = null
   const socket = entry.sock
   entry.sock = null
+  entry.detachCommandEvents?.()
+  entry.detachCommandEvents = null
   entry.pairCode = ''
   if (socket) {
     if (logout) { try { await socket.logout() } catch {} }
@@ -120,6 +123,12 @@ async function startEntry(entry, { pairing = false } = {}) {
     if (stopping || !entry.wantConnection) throw makeError('WhatsApp connection manager is shutting down.')
     const socket = socketFactory({ version, auth: state, browser: Browsers.macOS('Chrome'), logger: pino({ level: 'silent' }) })
     entry.sock = socket
+    // Additive event bridge: one registration per socket, guarded against stale sockets.
+    const messages = update => { if (entry.sock === socket && entry.status === 'connected' && !stopping) Promise.resolve().then(() => eventListener(socket, entry.id, 'messages.upsert', update)).catch(() => {}) }
+    const participants = update => { if (entry.sock === socket && entry.status === 'connected' && !stopping) Promise.resolve().then(() => eventListener(socket, entry.id, 'group-participants.update', update)).catch(() => {}) }
+    socket.ev.on('messages.upsert', messages)
+    socket.ev.on('group-participants.update', participants)
+    entry.detachCommandEvents = () => { socket.ev.off?.('messages.upsert', messages); socket.ev.off?.('group-participants.update', participants) }
     entry.requiresPairing = !state.creds.registered
     setStatus(entry, entry.retries ? 'reconnecting' : 'connecting')
     let resolvePair, rejectPair
@@ -163,6 +172,8 @@ async function startEntry(entry, { pairing = false } = {}) {
       }
       if (connection === 'close') {
         clearTimeout(entry.connectTimer)
+        entry.detachCommandEvents?.()
+        entry.detachCommandEvents = null
         entry.sock = null
         entry.pairCode = ''
         const code = statusCode(lastDisconnect?.error)
@@ -352,6 +363,7 @@ async function closeAllAccounts() {
 }
 
 function onAccountConnected(listener) { connectionListener = listener }
+function onAccountEvent(listener) { eventListener = listener }
 
 async function claimLegacyAccounts(ownerId) {
   await loadAccounts()
@@ -383,7 +395,7 @@ async function claimLegacyAccounts(ownerId) {
   return claimed
 }
 
-return { listAccounts, getAccount, ownsAccount, getAccountSocket, syncAccountContacts, getAccountStatusAudience, getPrimarySocket, createAccount, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected, claimLegacyAccounts };
+return { listAccounts, getAccount, ownsAccount, getAccountSocket, syncAccountContacts, getAccountStatusAudience, getPrimarySocket, createAccount, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected, onAccountEvent, claimLegacyAccounts };
 }
 const manager = createWhatsAppManager();
-export const { listAccounts, getAccount, ownsAccount, getAccountSocket, syncAccountContacts, getAccountStatusAudience, getPrimarySocket, createAccount, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected, claimLegacyAccounts } = manager;
+export const { listAccounts, getAccount, ownsAccount, getAccountSocket, syncAccountContacts, getAccountStatusAudience, getPrimarySocket, createAccount, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected, onAccountEvent, claimLegacyAccounts } = manager;

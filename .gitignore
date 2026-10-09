@@ -14,4 +14,21 @@ accounts/*/auth/
 messages.local.json
 auth.sqlite
 auth.sqlite-shm
+# Private databases, backup artifacts and local sandbox runtime data.
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+backups/
+.whatsapp-bot-backups/
+sandbox-data/
+.sandbox/
+**/creds.json
+**/session-*.json
+!deploy/session-manager-access.policy.json
+**/pre-key-*.json
+**/sender-key-*.json
+**/app-state-sync-key-*.json
 auth.sqlite-wal

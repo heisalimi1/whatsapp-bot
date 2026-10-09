@@ -86,6 +86,17 @@ pm2 logs whatsapp-bot --lines 100
 
 With the ecosystem file, `pm2 restart whatsapp-bot --update-env` reloads its config; if the process is stopped or needs a new config, use `pm2 start ecosystem.config.cjs --env production`. For rollback, inspect `git log -n 5 --oneline`, check the working tree, then use `git switch --detach <previous-commit>` and reinstall/restart. Return to the deployment branch with `git switch <branch>` afterward. Do not use `git reset --hard` or `git clean`; restore data from backup only through an explicit, verified procedure.
 
+## Bot Commands
+
+The existing dashboard now includes opt-in group administration, media conversion,
+automatic replies and command-based scheduling/broadcasts. See
+[Bot Commands: features, tests, migration, deployment and rollback](docs/bot-commands.md).
+New feature commands start disabled; no additional secret is required.
+For a separate local instance with empty test data and a spare WhatsApp account,
+see [the isolated local testing guide](docs/local-command-testing.md).
+The [production pre-deployment review](docs/production-predeployment.md) describes
+the explicit release file list and the backup/approval checks.
+
 ## Runtime and capacity
 
 The app allows at most two active send jobs and 500 saved jobs per account. A t3.micro is suitable only for a small number of accounts and modest scheduling volume; Baileys connections, media sends, and Nginx compete for limited memory/CPU. Start with one account, monitor `pm2 monit` and EC2 memory, and increase instance size before increasing concurrency. The PM2 memory restart threshold is 500 MB and should be adjusted only after observing real usage.

@@ -4,7 +4,7 @@ import crypto from 'crypto'
 import https from 'https'
 import fs from 'fs'
 import path from 'path'
-import { listAccounts, getAccountSocket, getAccountStatusAudience, syncAccountContacts, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected } from './whatsapp-manager.js'
+import { listAccounts, getAccountSocket, getAccountStatusAudience, syncAccountContacts, createAccount, getAccount, ownsAccount, claimLegacyAccounts, reconnectAccount, disconnectAccount, removeAccount, closeAllAccounts, onAccountConnected, onAccountEvent } from './whatsapp-manager.js'
 import { loadAutomation, saveAutomation, loadGroupSnapshot, saveGroupSnapshot, makeId } from './automation-store.js'
 import { normalizeDestinations, buildDeliveryPlan } from './automation-delivery.js'
 import { recurring, recoverInterruptedJob, validSendingDelays, intervalMilliseconds, nextIntervalRun, parseSchedule, createDeliveryRun, dispatchDeliveryRun, runMetrics } from './recurring-schedules.js'
@@ -13,6 +13,15 @@ import { cleanupExpiredAuthRecords, closeAuthStore, consumePasswordReset, create
 import { sendPasswordResetEmail } from './password-reset-mailer.js'
 import { FORGOT_PASSWORD_PAGE, LOGIN_PAGE as AUTH_LOGIN_PAGE, RESET_PASSWORD_PAGE, SIGNUP_PAGE } from './auth-pages.js'
 import { workspaceContext, selectWorkspace, workspaceMembers, createWorkspaceInvite, acceptWorkspaceInvite, removeWorkspaceMember, renameWorkspace, closeWorkspaceStore } from './workspace-store.js'
+import { createCommandStore } from './commands/store.js'
+import { createCommandEngine } from './commands/engine.js'
+import { createMediaService } from './commands/media.js'
+import { createCommandUtilities } from './commands/utilities.js'
+import { registerCommandRoutes } from './commands/routes.js'
+import { COMMAND_PAGE, COMMAND_SCRIPT, COMMAND_STYLE } from './commands/dashboard.js'
+
+// Match the database path used by the existing authentication imports.
+const commandStore = createCommandStore(process.env.AUTH_DATABASE_PATH || 'auth.sqlite')
 
 if (typeof process.loadEnvFile === 'function' && fs.existsSync('.env')) {
   try { process.loadEnvFile(path.resolve('.env')) }
@@ -84,6 +93,10 @@ let schedulerStarted = false
 let processCpuSample = { at: Date.now(), usage: process.cpuUsage() }
 let selfWrite = 0
 const testJobName = process.argv[2] === 'send' ? process.argv[3] : null
+const commandMedia = createMediaService()
+const commandUtilities = createCommandUtilities({ store: commandStore, dataFor, createJob: createCommandJob, cancelJob: cancelAccountJob })
+const commandEngine = createCommandEngine({ store: commandStore, media: commandMedia, getAccount, getSocket: getAccountSocket, services: commandUtilities, log })
+onAccountEvent(commandEngine.onEvent)
 
 process.on('unhandledRejection', () => log('Unhandled asynchronous operation failed.'))
 
@@ -110,6 +123,38 @@ async function dataFor(accountId) {
 }
 
 function saveAccountData(accountId, data) { accountData.set(accountId, data); saveAutomation(accountId, data) }
+
+// Commands use the same account files, validators, timers and delivery worker as the dashboard.
+function jobConfiguration(data, body) {
+  if (!String(body.name || '').trim() || /[\u0000-\u001f\u007f]/.test(String(body.name))) throw new Error('Enter an automation name.')
+  if (!data.messages.some(m => m.id === body.messageId)) throw new Error('Choose a saved message.')
+  const destination = normalizeDestinations(data, body)
+  if (destination.error) throw new Error(destination.error)
+  const repeatCount = Number(body.repeatCount ?? 1), delaySeconds = Array.isArray(body.delaySeconds) ? body.delaySeconds.map(Number) : data.delaySeconds
+  if (!Number.isInteger(repeatCount) || repeatCount < 1 || repeatCount > 100) throw new Error('Repeat count must be between 1 and 100.')
+  if (!validSendingDelays(delaySeconds)) throw new Error('Choose a fixed wait between sends from 0 to 365 days, or a random range from 0 to 600 seconds.')
+  const message = data.messages.find(m => m.id === body.messageId)
+  if (destination.value.toStatus && message.media && !['.png','.jpg','.jpeg','.webp','.mp4','.mov','.mkv','.3gp'].includes(path.extname(message.media).toLowerCase())) throw new Error('Choose text, an image or a video for WhatsApp Status.')
+  return { name: String(body.name).trim().slice(0, 100), messageId: body.messageId, ...destination.value, repeatCount, delaySeconds, ...parseSchedule(body) }
+}
+async function createCommandJob(accountId, body, sourceId, commandKind) {
+  const data = await dataFor(accountId)
+  const duplicate = data.jobs.find(job => job.commandSourceId === sourceId)
+  if (duplicate) return duplicate
+  if (data.jobs.length >= MAX_JOBS_PER_ACCOUNT) throw new Error('Remove an old schedule before adding another.')
+  const config = jobConfiguration(data, body)
+  const job = { id: makeId(), ...config, commandSourceId: sourceId, commandKind, status: 'scheduled', progress: 0, total: 0, createdAt: new Date().toISOString(), completedAt: '' }
+  data.jobs.push(job); saveAccountData(accountId, data); scheduleAccount(accountId, data)
+  if (!recurring(job) && !job.scheduleAt) runJob(accountId, job.id, { oneShot: true }).catch(() => {})
+  return job
+}
+async function cancelAccountJob(accountId, jobId) {
+  const data = await dataFor(accountId), job = data.jobs.find(j => j.id === jobId)
+  if (!job || ['completed', 'cancelled'].includes(job.status)) throw new Error('Choose an active schedule for this account.')
+  const key = `${accountId}:${jobId}`
+  job.status = 'cancelled'; stopRequests.set(key, 'cancelled'); removeQueuedJob(key)
+  saveAccountData(accountId, data); scheduleAccount(accountId, data)
+}
 
 function publicAutomation(data) {
   return {
@@ -443,6 +488,7 @@ async function shutdown(reason, exitCode = 0) {
   process.exitCode = exitCode
   shutdownPromise = (async () => {
     log('Graceful shutdown started:', reason)
+    const commandsStopped = commandEngine.stop()
     clearTimeout(reloadTimer)
     fs.unwatchFile(CONFIG)
     for (const tasks of cronTasks.values()) for (const task of tasks.values()) task.stop()
@@ -473,6 +519,7 @@ async function shutdown(reason, exitCode = 0) {
     await Promise.race([serverClosed, sleep(Math.max(0, stopAt - Date.now()))])
     await Promise.race([Promise.allSettled([...activeJobPromises.values()]), sleep(Math.max(0, stopAt - Date.now()))])
     if (dashboardServer?.listening) dashboardServer.closeAllConnections?.()
+    try { await Promise.race([commandsStopped, sleep(Math.max(0, stopAt - Date.now()))]); commandStore.close() } catch { log('Could not stop command processing cleanly.'); process.exitCode = 1 }
     try { await closeAllAccounts() } catch (e) { log('Could not close all WhatsApp sockets cleanly:', e.message); process.exitCode = 1 }
     try { closeWorkspaceStore(); closeAuthStore() } catch (e) { log('Could not close the authentication database cleanly:', e.message); process.exitCode = 1 }
     log('Graceful shutdown complete')
@@ -678,6 +725,7 @@ function startDashboard() {
   })
 
   app.get('/api/accounts', async (req, res) => res.json({ accounts: await listAccounts(req.workspace.id) }))
+  registerCommandRoutes(app, { store: commandStore, media: commandMedia, dataFor, groupsFor: id => accountGroups.get(id) || [] })
   app.get('/api/accounts/:id', async (req, res) => {
     const account = await getAccount(req.params.id)
     if (!account) return res.status(404).json({ error: 'Account not found.' })
@@ -834,7 +882,7 @@ function startDashboard() {
       const nextJobs = checked.value.jobs.map(j => {
         const prior = priorJobs.get(j.id)
         if (!prior) return j
-        for (const key of ['status', 'progress', 'total', 'createdAt', 'scheduledAt', 'startedAt', 'completedAt', 'failedCount', 'lastError', 'activeRun', 'lastOccurrenceAt', 'lastRunAt', 'nextRunAt', 'retryAt', 'resumeOnRestart', 'uncertainCount']) if (prior[key] !== undefined) j[key] = prior[key]
+        for (const key of ['status', 'progress', 'total', 'createdAt', 'scheduledAt', 'startedAt', 'completedAt', 'failedCount', 'lastError', 'activeRun', 'lastOccurrenceAt', 'lastRunAt', 'nextRunAt', 'retryAt', 'resumeOnRestart', 'uncertainCount', 'commandSourceId', 'commandKind']) if (prior[key] !== undefined) j[key] = prior[key]
         return j
       })
       Object.assign(previous, checked.value, { jobs: nextJobs })
@@ -870,18 +918,6 @@ function startDashboard() {
     res.json({ path: path.relative(process.cwd(), file) })
   })
 
-  const jobConfiguration = (data, body) => {
-    if (!String(body.name || '').trim() || /[\u0000-\u001f\u007f]/.test(String(body.name))) throw new Error('Enter an automation name.')
-    if (!data.messages.some(m => m.id === body.messageId)) throw new Error('Choose a saved message.')
-    const destination = normalizeDestinations(data, body)
-    if (destination.error) throw new Error(destination.error)
-    const repeatCount = Number(body.repeatCount ?? 1), delaySeconds = Array.isArray(body.delaySeconds) ? body.delaySeconds.map(Number) : data.delaySeconds
-    if (!Number.isInteger(repeatCount) || repeatCount < 1 || repeatCount > 100) throw new Error('Repeat count must be between 1 and 100.')
-    if (!validSendingDelays(delaySeconds)) throw new Error('Choose a fixed wait between sends from 0 to 365 days, or a random range from 0 to 600 seconds.')
-    const message = data.messages.find(m => m.id === body.messageId)
-    if (destination.value.toStatus && message.media && !['.png','.jpg','.jpeg','.webp','.mp4','.mov','.mkv','.3gp'].includes(path.extname(message.media).toLowerCase())) throw new Error('Choose text, an image or a video for WhatsApp Status.')
-    return { name: String(body.name).trim().slice(0, 100), messageId: body.messageId, ...destination.value, repeatCount, delaySeconds, ...parseSchedule(body) }
-  }
   app.post('/api/accounts/:id/jobs', async (req, res) => {
     try {
       const data = await dataFor(req.params.id)
@@ -990,9 +1026,10 @@ input[type=checkbox]{accent-color:var(--green);width:18px;height:18px;flex-shrin
 @media(max-width:850px){.automation-layout{grid-template-columns:1fr}.preview-panel{position:static}}@media(max-width:600px){header{flex-wrap:wrap}header b{flex:1 1 220px;white-space:nowrap}header select{order:3;max-width:none;margin:0;flex:1 1 calc(100% - 100px)}header>button{order:4}.field-grid,.destination-grid{grid-template-columns:1fr}.card{padding:16px}.page-heading{align-items:flex-start}.submit-row{align-items:flex-start;flex-direction:column}.submit-row button{width:100%}h1{font-size:26px}}
 /* Keep entry pages, activity lines, and dynamic content within the viewport. */
 body{overflow-wrap:anywhere}main{width:100%;min-width:0}header>*{min-width:0;max-width:100%}.card{min-width:0;max-width:100%}.grid{grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr))}input,select,textarea{min-width:0;max-width:100%}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-width:100%}.toast{max-width:calc(100% - 32px)}
+${COMMAND_STYLE}
 </style></head><body>
 <header><b>Business WhatsApp</b><select id="workspaceSelect" aria-label="Business workspace" onchange="switchWorkspace(this.value)"></select><span id="topStatus" class="pill">Loading</span><span id="syncState" class="muted" role="status" aria-live="polite">Checking server</span><select id="accountSelect" aria-label="WhatsApp account" onchange="selectAccount(this.value)"></select><button class="secondary" onclick="logout()">Logout</button></header>
-<main><nav class="nav"><button data-view="overview" onclick="showView('overview')">Overview</button><button data-view="accounts" onclick="showView('accounts')">Accounts</button><button data-view="messages" onclick="showView('messages')">Messages</button><button data-view="groups" onclick="showView('groups')">Recipients &amp; Groups</button><button data-view="jobs" onclick="showView('jobs')">Automations</button><button data-view="settings" onclick="showView('settings')">Settings</button></nav>
+<main><nav class="nav"><button data-view="overview" onclick="showView('overview')">Overview</button><button data-view="accounts" onclick="showView('accounts')">Accounts</button><button data-view="messages" onclick="showView('messages')">Messages</button><button data-view="groups" onclick="showView('groups')">Recipients &amp; Groups</button><button data-view="jobs" onclick="showView('jobs')">Automations</button><button data-view="commands" onclick="showView('commands')">Bot Commands</button><button data-view="settings" onclick="showView('settings')">Settings</button></nav>
 <section id="overview" class="view"><h1>Dashboard</h1><div class="grid"><div class="card"><small>WhatsApp accounts</small><div class="stat" id="accountCount">0</div><button onclick="showView('accounts')">Manage accounts</button></div><div class="card"><small>Active jobs</small><div class="stat" id="activeCount">0</div><button onclick="showView('jobs')">View automations</button></div><div class="card"><small>Scheduled jobs</small><div class="stat" id="scheduledCount">0</div><button onclick="showView('jobs')">View schedule</button></div></div><div class="card"><h2>WhatsApp Accounts</h2><div id="overviewAccounts"></div><button onclick="showView('accounts')">＋ Connect WhatsApp</button></div><div class="card"><h2>Active Automations</h2><div id="overviewJobs"></div></div><div class="card"><h2>Recent Activity</h2><pre id="overviewLog"></pre></div><div class="card"><h2>Quick actions</h2><div class="actions"><button onclick="showView('accounts')">Connect WhatsApp</button><button onclick="newMessage();showView('messages')">Create Message</button><button onclick="showView('groups')">Manage Groups</button><button onclick="showView('jobs')">Create Automation</button></div></div></section>
 <section id="accounts" class="view"><h1>WhatsApp Accounts</h1><div class="card"><h2>＋ Connect WhatsApp</h2><div class="muted">Enter the phone number with country code. We’ll show a pairing code here.</div><div class="account-connect-form"><label for="newAccountName">Business or account name (optional)<input id="newAccountName" type="text" placeholder="Business or account name" autocomplete="organization"></label><label for="newAccountPhone">WhatsApp phone number<input id="newAccountPhone" type="tel" inputmode="tel" autocomplete="tel" spellcheck="false" dir="ltr" aria-describedby="accountPhoneHelp" placeholder="Country code + phone number"></label><p id="accountPhoneHelp" class="help">Include your country code, such as +1 or +234. Check the full number before connecting.</p><button id="connectAccountButton" onclick="connectAccount()">Connect WhatsApp</button></div><p id="accountFeedback" class="form-feedback" role="status" aria-live="polite"></p><div id="pairCode"></div></div><div id="accountCards" class="grid"></div></section>
 <section id="messages" class="view"><h1>Messages</h1><div class="card"><h2 id="messageFormTitle">Create message</h2><input id="messageName" type="text" placeholder="Message name"><textarea id="messageText" placeholder="Message text. Separate rotating versions with a line containing ---"></textarea><div class="row"><input id="messageFile" type="file" accept="image/*,video/mp4,video/quicktime"><button class="secondary" onclick="uploadMessageMedia()">Upload media</button><span id="mediaLabel" class="muted"></span></div><div class="actions"><button onclick="saveMessage()">Save message</button><button class="secondary" onclick="previewMessage()">Preview</button><button class="secondary" onclick="newMessage()">Clear</button></div></div><div id="messageCards" class="grid"></div></section>
@@ -1025,6 +1062,7 @@ body{overflow-wrap:anywhere}main{width:100%;min-width:0}header>*{min-width:0;max
 <aside class="card preview-panel"><span class="eyebrow">Your campaign</span><h2>Ready to send?</h2><div id="jobPreview" class="preview-text">Choose a saved message to preview it here.</div><p id="jobMediaHint" class="help"></p><div class="summary-line"><span>Destinations</span><strong id="jobDestinationSummary">Choose a destination</strong></div><div class="summary-line"><span>Schedule</span><strong id="jobScheduleSummary">Send now</strong></div><div class="summary-line"><span>Sending interval</span><strong id="jobPacingSummary"></strong></div><div class="summary-line"><span>Account</span><strong id="jobConnectionSummary"></strong></div><small>Your messages and audience stay separate for each WhatsApp account.</small></aside>
 </div><div class="page-heading" style="margin-top:28px"><div><h2>Your automations</h2><p class="muted">Track deliveries and manage upcoming campaigns.</p></div></div><div id="jobCards"></div></section>
 <section id="settings" class="view"><h1>Settings</h1><div class="card"><label>Timezone<input id="timezone" type="text" placeholder="Africa/Lagos"></label><div class="row"><label>Default minimum wait (seconds)<input id="defaultMin" type="number" min="0" max="600"></label><label>Default maximum wait (seconds)<input id="defaultMax" type="number" min="0" max="600"></label></div><p class="help">Use the same minimum and maximum for a fixed sending interval.</p><button onclick="saveSettings()">Save settings</button><h2>WhatsApp Status audience</h2><p class="help">Contacts sync from your WhatsApp account automatically. Manage who can see your Status in WhatsApp on your phone. You do not need to enter viewer numbers here.</p><button class="secondary" onclick="syncStatusContacts()">Sync WhatsApp contacts</button></div><div class="card"><h2>Business &amp; team</h2><p id="workspaceNameSummary" class="help"></p><div id="workspaceOwnerPanel"><label>Business name<input id="workspaceName" maxlength="80"></label><button class="secondary" onclick="saveWorkspaceName()">Save business name</button><h3>Invite a team member</h3><p class="help">Invite their dashboard email. Share the one-use code directly with them; it expires after 24 hours.</p><label>Member email<input id="workspaceInviteEmail" type="email" autocomplete="off"></label><button onclick="inviteWorkspaceMember()">Generate invitation</button><label>Invitation code<textarea id="workspaceInviteCode" readonly autocomplete="off"></textarea></label><button class="secondary" onclick="copyWorkspaceInvite()">Copy code</button><h3>Members</h3><button class="secondary" onclick="loadWorkspaceMembers()">Refresh members</button><div id="workspaceMembers"></div></div><h3>Join a business</h3><p class="help">Sign in with the email your business owner invited, then paste their invitation code.</p><label>Invitation code<input id="workspaceJoinCode" autocomplete="off"></label><button onclick="joinWorkspace()">Join business</button></div></section>
+${COMMAND_PAGE}
 </main><div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script>
 var S=null, accountId='', activeView='overview', editMessageId='', mediaPath='', pairCode='', pairAccountId='', toastTimer=null, csrfToken='';
@@ -1035,7 +1073,7 @@ function api(url,method,body){method=method||'GET';var headers={'Content-Type':'
 function logout(){api('/api/logout','POST',{}).then(function(){location.assign('/login')}).catch(function(e){toast(e.message,true)})}
 function toast(msg,bad){var el=document.getElementById('toast');el.textContent=msg;el.className='toast'+(bad?' err':'');el.style.display='block';clearTimeout(toastTimer);toastTimer=setTimeout(function(){el.style.display='none'},3500)}
 function selectedAccount(){return (S.accounts||[]).find(function(a){return a.id===accountId})}
-function showView(name){activeView=name;document.querySelectorAll('.view').forEach(function(x){x.classList.toggle('sel',x.id===name)});document.querySelectorAll('.nav button').forEach(function(x){x.classList.toggle('sel',x.dataset.view===name)})}
+function showView(name){activeView=name;document.querySelectorAll('.view').forEach(function(x){x.classList.toggle('sel',x.id===name)});document.querySelectorAll('.nav button').forEach(function(x){x.classList.toggle('sel',x.dataset.view===name)});if(name==='commands')loadBotCommands()}
 function selectAccount(id){accountId=id;pairCode='';document.querySelectorAll('.jobList,.jobRecipient').forEach(function(x){x.checked=false});document.getElementById('jobMessage').value='';document.getElementById('jobFeedback').textContent='';return loadState().then(function(){toast('Account selected.')}).catch(function(e){toast(e.message,true)})}
 function switchJobAccount(id){if(id&&id!==accountId)selectAccount(id)}
 function loadState(options){
@@ -1050,7 +1088,7 @@ function loadState(options){
     return d
   })
 }
-function renderLiveStatus(){var a=selectedAccount();document.getElementById('topStatus').textContent=a?a.status.replace(/_/g,' '):'No WhatsApp account';renderAccounts();}
+function renderLiveStatus(){var a=selectedAccount();document.getElementById('topStatus').textContent=a?a.status.replace(/_/g,' '):'No WhatsApp account';renderAccounts();if(activeView==='commands')loadBotCommands();}
 function pollState(){if(pollInFlight||document.hidden)return;pollInFlight=true;return loadState({background:true}).catch(function(){document.getElementById('syncState').textContent='Server temporarily unavailable; retrying'}).finally(function(){pollInFlight=false})}
 function switchWorkspace(id){return api('/api/workspaces/select','POST',{workspaceId:id}).then(function(){accountId='';pairCode='';groupListDrafts.clear();return loadState()}).catch(function(e){toast(e.message,true)})}
 function renderWorkspace(){
@@ -1288,6 +1326,7 @@ function jobAction(id,action){var words={start:'started',pause:'paused',resume:'
 function deleteJob(id){if(!confirm('Delete this automation?'))return;api('/api/accounts/'+encodeURIComponent(accountId)+'/jobs/'+encodeURIComponent(id),'DELETE').then(function(){toast('Job deleted.');return loadState()}).catch(function(e){toast(e.message,true)})}
 function renderSettings(){renderWorkspace();if(['timezone','defaultMin','defaultMax'].includes(document.activeElement?.id))return;document.getElementById('timezone').value=S.cfg.timezone||'Africa/Lagos';document.getElementById('defaultMin').value=(S.cfg.delaySeconds||[5,15])[0];document.getElementById('defaultMax').value=(S.cfg.delaySeconds||[5,15])[1]}
 function saveSettings(){S.cfg.timezone=document.getElementById('timezone').value;S.cfg.delaySeconds=[Number(document.getElementById('defaultMin').value),Number(document.getElementById('defaultMax').value)];jobTimingAccount='';saveData('Settings saved.').catch(function(){})}
+${COMMAND_SCRIPT}
 fetch('/api/session').then(function(r){if(!r.ok){location.assign('/login');throw new Error('Sign in again.')}return r.json()}).then(function(x){csrfToken=x.csrfToken;return loadState()}).then(function(){showView('overview')}).catch(function(e){if(e.message!=='Sign in again.')toast(e.message,true)});setInterval(pollState,3000);
 document.addEventListener('visibilitychange',function(){if(!document.hidden)pollState()});
 document.addEventListener('focusout',function(){setTimeout(function(){if(S&&!/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName||''))render()},0)});
