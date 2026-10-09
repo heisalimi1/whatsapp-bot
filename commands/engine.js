@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { COMMANDS, COMMAND_BY_NAME, adminActions, ownerOnly } from './catalog.js'
+import { COMMANDS, COMMAND_BY_NAME, adminActions } from './catalog.js'
 import { userJid, groupJid, matchesPhrase, unauthorizedLink } from './settings.js'
 import { containsViewOnce, mediaFrom, MediaError, BoundedQueue } from './media.js'
 
@@ -132,17 +132,22 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     if (definition.category === 'Group Administration') {
       await metadata(context)
       if (adminActions.has(name)) await requireAdmin(context, ['kick', 'promote', 'demote', 'mute', 'unmute'].includes(name))
-      if (name === 'tagall' || name === 'hidetag') {
+      if (name === 'tagall' || name === 'tag') {
+        if (name === 'tag' && !argument) throw new CommandError(`Usage: ${config.prefix}tag <message>`)
         const identities = new Map()
         for (const member of context.metadata.participants) {
           const jid = userJid(member.id), canonical = userJid(member.phoneNumber) || jid
           if (jid && canonical && !identities.has(canonical)) identities.set(canonical, jid)
         }
         const members = [...identities.values()]
-        // WhatsApp has practical mention/text limits: use bounded sequential batches.
-        for (let offset = 0; offset < members.length; offset += 100) {
+        if (name === 'tag') {
+          // Hidden mentions share one message, regardless of the group size.
+          // The persistent incoming receipt prevents replay after reconnect/restart.
+          await send(context, { text: argument, mentions: members })
+        } else for (let offset = 0; offset < members.length; offset += 100) {
+          // Visible member lists remain bounded to keep each text readable.
           const batch = members.slice(offset, offset + 100)
-          await send(context, { text: (argument || 'Group announcement') + (name === 'tagall' ? '\n' + batch.map(jid => '@' + jid.split('@')[0]).join(' ') : ''), mentions: batch })
+          await send(context, { text: (argument ? argument + '\n' : '') + batch.map(jid => '@' + jid.split('@')[0]).join(' '), mentions: batch })
         }
       } else if (['kick', 'promote', 'demote'].includes(name)) {
         const member = await target(context, argument)
@@ -242,10 +247,13 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     const account = await getAccount(accountId)
     if (!account?.workspaceId || await getSocket(accountId) !== socket) return
     const { config } = store.settings(account.workspaceId, accountId)
+    const looksLikeCommand = parsed.text.startsWith(config.prefix)
+    // Commands are accepted only from this connected account's own devices.
+    // Ignore other people's commands before moderation, replies or receipt writes.
+    if (looksLikeCommand && message.key.fromMe !== true) return
     const sender = userJid(message.key.fromMe ? socket.user?.id : groupJid(chat) ? message.key.participant : chat)
     if (!sender) return
     const context = { account, socket, message, chat, sender, config, ...parsed, owner: message.key.fromMe === true }
-    const looksLikeCommand = parsed.text.startsWith(config.prefix)
     let isCommand = looksLikeCommand
     if (message.key.fromMe && !isCommand) return
     if (message.key.fromMe && await services.isAutomationMessage?.(accountId, message.key.id)) return
@@ -265,16 +273,6 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
           if (rule && cooldown(`autoreply:${accountId}:${chat}`, config.autoreply.cooldownSeconds) && allow(`reply-account:${accountId}`, config.perAccountPerMinute, 60000)) await reply(context, rule.reply)
         }
         return
-      }
-      if (ownerOnly.has(name) && !context.owner) throw new CommandError('Only the connected WhatsApp account owner can use this command.')
-      const permission = config.commands[name].permission
-      if (!context.owner) {
-        if (permission === 'owner') throw new CommandError('Only the connected WhatsApp account owner can use this command.')
-        if (permission === 'admin') await requireAdmin(context)
-        if (permission === 'permitted') {
-          const identities = await aliases(socket, sender)
-          if (!config.permittedUsers.some(jid => identities.has(jid))) throw new CommandError('The account owner has not granted you access to this command.')
-        }
       }
       if (!allow(`account:${accountId}`, config.perAccountPerMinute, 60000) || !allow(`chat:${accountId}:${chat}`, config.perChatPerMinute, 60000) || !cooldown(`command:${accountId}:${chat}:${sender}:${name}`, config.cooldownSeconds)) throw new CommandError('The previous command is still within its cooldown. Please wait a moment.')
       await execute(context, name, argument)

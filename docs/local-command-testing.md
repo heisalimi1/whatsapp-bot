@@ -29,10 +29,13 @@ existing server. The launcher prints the exact localhost URL.
    settings**. Then select the test group, configure its rules and **Save group
    settings**. The default prefix is `.`; all 19 feature commands start disabled.
 
-Send owner commands from the connected spare account's phone or its linked
+Send all commands from the connected spare account's phone or its linked
 devices. A dashboard login does not make a different phone the WhatsApp command
 owner. Basic commands can be tried in the spare account's own chat. Group actions
 need verified administrator permissions even when sent by the account owner.
+Send `.menu`, `.tag Test announcement` and other commands from a different
+test-group member or a private chat: there should be no reply or command action,
+even when that member is an administrator. Commands cannot be delegated.
 The default command cooldown is five seconds for repeat uses of the same command.
 
 ## Checklist for all 23 commands
@@ -40,7 +43,7 @@ The default command cooldown is five seconds for repeat uses of the same command
 | Commands | Test and expected result |
 | --- | --- |
 | `.menu`, `.help`, `.ping`, `.alive` | Menu lists enabled commands, help explains usage, ping returns Pong, alive reports the connection. Try `.help antiword`. |
-| `.tagall`, `.hidetag` | Send `.tagall Test announcement` and `.hidetag Test announcement` in the test group. Mentions target current members; hidetag does not list their names. |
+| `.tagall`, `.tag` | Send `.tagall Test announcement` and `.tag Test announcement` in the spare-account test group. `.tag` sends the text once with hidden mentions, including for groups over 100 members. Send `.tag` without text: only usage guidance should appear, with no mentions. `.tagall` keeps visible member lists in batches. |
 | `.promote`, `.demote` | Mention/reply to a willing test member, promote them, then demote them. Verify permissions in WhatsApp. The bot and group founder are protected. |
 | `.mute`, `.unmute` | Mute the test group; a non-admin cannot post. Unmute it and verify they can post again. |
 | `.kick` | Mention/reply to a disposable non-admin test member. Verify removal, then invite them back when desired. |

@@ -38,7 +38,7 @@ export function validateAccountSettings(input) {
   value.commands = Object.fromEntries(COMMANDS.map(c => {
     const setting = value.commands[c.name] || d.commands[c.name]
     bool(setting.enabled, 'command')
-    if (!['owner', 'admin', 'permitted'].includes(setting.permission)) throw Error('Choose owner, group administrator or permitted users.')
+    if (!['owner', 'admin', 'permitted'].includes(setting.permission)) throw Error('Commands are restricted to the connected account owner.')
     if (ownerOnly.has(c.name) && setting.permission !== 'owner') throw Error(`${c.name} is restricted to the connected account owner.`)
     return [c.name, { enabled: setting.enabled, permission: setting.permission }]
   }))

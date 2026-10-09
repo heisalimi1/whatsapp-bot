@@ -31,7 +31,7 @@ export function createCommandStore(databasePath, { now = Date.now } = {}) {
     const defaults = accountDefaults(), stored = row ? JSON.parse(row.config) : defaults
     // Project only current commands without rewriting existing database records.
     // Old saved settings remain usable after catalog entries are retired.
-    const commands = Object.fromEntries(COMMANDS.map(c => [c.name, stored.commands?.[c.name] || defaults.commands[c.name]]))
+    const commands = Object.fromEntries(COMMANDS.map(c => [c.name, { ...(stored.commands?.[c.name] || (c.name === 'tag' ? stored.commands?.hidetag : undefined) || defaults.commands[c.name]), permission: 'owner' }]))
     return { revision: row?.revision || 0, config: { ...defaults, ...stored, commands } }
   }
   function saveSettings(w, a, config, revision) {
@@ -81,7 +81,16 @@ export function createCommandStore(databasePath, { now = Date.now } = {}) {
       return db.prepare('INSERT INTO bot_welcome_receipts VALUES(?,?,?,?,?) ON CONFLICT(workspace_id,account_id,group_jid,member_jid) DO UPDATE SET created_at=excluded.created_at WHERE created_at<?').run(...scope(w, a), jid, userJid(member), now(), now() - 600000).changes === 1
     },
     statistic(w, a, command, success) { db.prepare('INSERT INTO bot_command_statistics VALUES(?,?,?,?,?) ON CONFLICT(workspace_id,account_id,command) DO UPDATE SET successes=successes+excluded.successes,failures=failures+excluded.failures').run(...scope(w, a), command, success ? 1 : 0, success ? 0 : 1) },
-    statistics(w, a) { return db.prepare('SELECT command,successes,failures FROM bot_command_statistics WHERE workspace_id=? AND account_id=?').all(...scope(w, a)).filter(row => COMMAND_BY_NAME.has(row.command)) },
+    statistics(w, a) {
+      const totals = new Map()
+      for (const row of db.prepare('SELECT command,successes,failures FROM bot_command_statistics WHERE workspace_id=? AND account_id=?').all(...scope(w, a))) {
+        const command = row.command === 'hidetag' ? 'tag' : row.command
+        if (!COMMAND_BY_NAME.has(command)) continue
+        const total = totals.get(command) || { command, successes: 0, failures: 0 }
+        total.successes += row.successes; total.failures += row.failures; totals.set(command, total)
+      }
+      return [...totals.values()]
+    },
     prepareBroadcast(w, a, chat, payload) {
       const token = crypto.randomBytes(12).toString('hex'), hash = crypto.createHash('sha256').update(token).digest('hex')
       transaction(() => {

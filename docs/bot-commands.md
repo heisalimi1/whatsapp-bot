@@ -37,7 +37,7 @@ for the connected WhatsApp account owner only.
 
 | Category | Supported |
 | --- | --- |
-| Group administration (12) | `tagall`, `hidetag`, `kick`, `promote`, `demote`, `mute`, `unmute`, `antilink`, `antiword`, `antispam`, `welcome`, `warn` |
+| Group administration (12) | `tagall`, `tag`, `kick`, `promote`, `demote`, `mute`, `unmute`, `antilink`, `antiword`, `antispam`, `welcome`, `warn` |
 | Media (3) | `sticker` (image/short video), `toimg` (sticker to PNG), `tomp3` (video audio to MP3) |
 | Utilities (4) | `autoreply`, `schedule`, `broadcast`, `statussave` |
 | Basic (4) | `menu`, `help`, `ping`, `alive` |
@@ -45,12 +45,12 @@ for the connected WhatsApp account owner only.
 ## Dashboard and usage
 
 **Bot Commands** extends the current sidebar and responsive dashboard. Select an
-existing WhatsApp account, choose commands/access, and save account settings.
+existing WhatsApp account, choose enabled commands, and save account settings.
 Group moderation and welcome settings are saved separately after selecting a
 group. The corresponding account command must also be enabled. Business owners
 can change settings; business members can view them.
 
-The dashboard supports prefix/access controls, category switches, cooldowns,
+The dashboard supports prefix controls, category switches, cooldowns,
 media limits, automatic reply CRUD, opted-in broadcast lists, group domain and
 phrase lists, moderation thresholds/actions, welcome templates, and warning
 review/reset. It preserves unsaved drafts while polling, detects conflicting
@@ -63,6 +63,7 @@ placeholders, not real contacts or account identifiers:
 ```text
 .help antiword
 .tagall Please read the announcement
+.tag Please read this message
 .kick @member
 .promote @member
 .demote @member
@@ -90,6 +91,14 @@ placeholders, not real contacts or account identifiers:
 .broadcast confirm <one-use confirmation>
 ```
 
+`.tag <message>` sends one message with hidden mentions of current group members,
+even in groups with more than 100 members. Without message text it replies with
+usage guidance and no mentions. Replayed command events and outgoing echoes are
+ignored using persistent receipts; unconfirmed sends are not retried. Existing
+hidden-tag settings and statistics appear under `.tag` without rewriting old data.
+`.tagall` keeps its visible member lists and bounded batches, with no generated
+"Group announcement" placeholder when no text is supplied.
+
 Media commands accept supported attachments or quoted media. Statussave requires
 a quoted accessible Status image/video and explicit sender-consent confirmation
 in the dashboard; it sends a copy back to the command chat and deletes its local
@@ -97,12 +106,15 @@ temporary file. It is not an archive or recovery tool. View-once, expired,
 inaccessible, and text-only Status cannot be saved. Animated stickers converted
 to images use their first frame. MP3 extraction requires a video audio track.
 
-Owner commands are identified by Baileys `key.fromMe`, meaning the connected
-account's WhatsApp/linked devices. A dashboard workspace role alone does not
-grant a different WhatsApp number owner-command privileges. Utilities cannot be
-delegated. Other commands can use owner, current group administrator, or an
-explicit permitted-user list; administrative actions still require current group
-admin privileges. Removal, promotion, demotion and mute changes additionally
+All commands are identified by Baileys `key.fromMe === true`, meaning the connected
+account's WhatsApp/linked devices. Commands from everyone else are silently
+ignored before replies, moderation or command side effects, including group
+administrators and previously permitted users. No command can be delegated.
+Existing stored access settings are projected to owner-only without rewriting
+old database records. Ordinary automatic replies, moderation and welcomes remain
+available; command messages from other people do not trigger them.
+Administrative actions still require current group admin privileges.
+Removal, promotion, demotion and mute changes additionally
 require the bot to be an admin. The connected account and group founder cannot
 be targeted. Replies, mentions and verified numeric/member identifiers work as
 targets. PN/LID aliases are verified through the existing socket mapping.

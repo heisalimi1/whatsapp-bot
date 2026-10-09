@@ -84,16 +84,45 @@ test('history, old messages, automation echoes and stale sockets never execute',
 })
 test('owner-only utilities cannot be delegated; nonowners cannot execute owner commands', async t => {
   const f = fixture(t); f.enable('schedule', 'broadcast', 'autoreply')
-  await f.send('.schedule list'); assert.match(f.calls.at(-1).content.text, /Only the connected/); assert.equal(f.scheduled.length, 0)
-  await f.send('.broadcast anything'); assert.equal(f.broadcasted.length, 0)
+  await f.send('.schedule list'); assert.equal(f.calls.length, 0); assert.equal(f.scheduled.length, 0)
+  await f.send('.broadcast anything'); assert.equal(f.calls.length, 0); assert.equal(f.broadcasted.length, 0)
   assert.throws(() => f.configure(c => { c.commands.broadcast.permission = 'permitted' }), /restricted/)
   await f.send('.schedule list', { key: ownerKey }); assert.equal(f.scheduled[0].id, accountId)
 })
+
+test('all commands from other people are silently ignored before replies, moderation or side effects', async t => {
+  const f = fixture(t); f.enable(...COMMANDS.map(c => c.name))
+  f.configure(c => { c.permittedUsers = [member, administrator]; c.autoreply.enabled = true; c.autoreply.rules = [{ id: 'command-trigger', trigger: '.ping', reply: 'Must not reply' }] })
+  f.store.saveGroup(workspace, accountId, group, { antiword: true, words: ['blocked command'], action: 'warn-delete' })
+  const originalSettings = f.store.settings.bind(f.store)
+  t.mock.method(f.store, 'settings', (...args) => {
+    const result = originalSettings(...args)
+    for (const setting of Object.values(result.config.commands)) setting.permission = 'permitted'
+    return result
+  })
+  const metadata = t.mock.method(f.socket, 'groupMetadata')
+  for (const command of COMMANDS) {
+    for (const participant of [member, administrator, owner]) await f.send('.' + command.name + ' blocked command', { key: { participant, fromMe: false } })
+    await f.send('.' + command.name, { key: { remoteJid: member, fromMe: false } })
+  }
+  await f.send('.ping', { key: { participant: owner, fromMe: undefined } })
+  await f.send('', { message: { imageMessage: { caption: '.sticker', url: 'https://mmg.whatsapp.net/test-only' } } })
+  await f.send('.not-a-command blocked command')
+  assert.equal(f.calls.length, 0); assert.equal(f.scheduled.length, 0); assert.equal(f.broadcasted.length, 0)
+  assert.equal(metadata.mock.callCount(), 0)
+  const connection = new DatabaseSync(f.database)
+  try {
+    for (const table of ['bot_command_receipts', 'bot_command_statistics', 'bot_warnings']) assert.equal(connection.prepare('SELECT count(*) AS count FROM ' + table).get().count, 0)
+  } finally { connection.close() }
+  f.advance(); await f.send('.ping', { key: ownerKey })
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0].content.text, 'Pong!')
+  for (const command of COMMANDS) for (const permission of ['admin', 'permitted']) assert.throws(() => f.configure(c => { c.commands[command.name].permission = permission }), /restricted/)
+})
 test('group administration checks sender and bot permissions and protects group owner', async t => {
   const f = fixture(t); f.enable('kick', 'mute', 'unmute', 'promote', 'demote')
-  await f.send('.kick ' + member); assert.equal(f.calls.some(c => c.action), false); assert.match(f.calls.at(-1).content.text, /administrator/)
+  await f.send('.kick ' + member); assert.equal(f.calls.length, 0)
   f.advance(); f.groups.participants[0].admin = null
-  await f.send('.kick ' + member, { key: { participant: administrator } }); assert.equal(f.calls.some(c => c.action), false); assert.match(f.calls.at(-1).content.text, /Make the connected/)
+  await f.send('.kick ' + member, { key: ownerKey }); assert.equal(f.calls.some(c => c.action), false); assert.match(f.calls.at(-1).content.text, /administrator/)
   f.groups.participants[0].admin = 'admin'; f.advance()
   await f.send('.kick ' + founder, { key: ownerKey }); assert.match(f.calls.at(-1).content.text, /cannot be targeted/)
   f.advance(); await f.send('.kick ' + member, { key: ownerKey }); assert.deepEqual(f.calls.find(c => c.action).members, [member])
@@ -111,14 +140,105 @@ test('quoted and mentioned targets use verified LID/PN aliases', async t => {
   f.advance(); await f.send('', { key: ownerKey, message: { extendedTextMessage: { text: '.kick', contextInfo: { mentionedJid: [member] } } } })
   assert.equal(f.calls.filter(c => c.action).length, 2)
 })
-test('tagall/hidetag deduplicate members and send bounded batches', async t => {
-  const f = fixture(t); f.enable('tagall', 'hidetag')
+test('tagall keeps deduplicated visible member batches without a generated announcement', async t => {
+  const f = fixture(t); f.enable('tagall')
   f.groups.participants.push(...Array.from({ length: 205 }, (_, i) => ({ id: `${15105551000 + i}@s.whatsapp.net` })), { id: member })
   await f.send('.tagall Notice', { key: ownerKey })
   assert.equal(f.calls.length, 3); assert(f.calls.every(c => c.content.mentions.length <= 100))
   const mentions = f.calls.flatMap(c => c.content.mentions); assert.equal(mentions.length, new Set(mentions).size)
-  f.calls.length = 0; f.advance(); await f.send('.hidetag Announcement', { key: ownerKey })
-  assert(f.calls.every(c => c.content.text === 'Announcement'))
+  f.calls.length = 0; f.advance(); await f.send('.tagall', { key: ownerKey })
+  assert.equal(f.calls.length, 3)
+  assert(f.calls.every(c => c.content.text.startsWith('@') && !c.content.text.includes('Group announcement')))
+})
+
+test('tag sends one hidden-mention message to large groups and rejects replay and echoes', async t => {
+  const f = fixture(t); f.enable('tag')
+  f.groups.participants.push(...Array.from({ length: 205 }, (_, i) => ({ id: `${15105551000 + i}@s.whatsapp.net` })), { id: member }, { id: '1000000002@lid', phoneNumber: member })
+  const msg = f.message('.tag .tag Please read this\nSecond line', { key: ownerKey })
+  await Promise.all([f.deliver(msg), f.deliver(msg), f.deliver(msg)])
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.calls[0].content.text, '.tag Please read this\nSecond line')
+  const mentions = f.calls[0].content.mentions
+  assert.equal(mentions.length, 209); assert.equal(mentions.length, new Set(mentions).size)
+  const outgoingId = f.calls[0].options.messageId
+  await f.restart(); f.advance(); f.replaceSocket(); await f.deliver(msg)
+  await f.send(f.calls[0].content.text, { key: { ...ownerKey, id: outgoingId } })
+  assert.equal(f.calls.length, 1)
+  const secondStore = createCommandStore(f.database), secondEngine = f.makeEngine(secondStore)
+  try {
+    await secondEngine.onEvent(f.socket, accountId, 'messages.upsert', { type: 'notify', messages: [msg] })
+    assert.equal(f.calls.length, 1)
+  } finally { await secondEngine.stop(); secondStore.close() }
+})
+
+test('tag without text returns one usage reply without mentioning members', async t => {
+  const f = fixture(t); f.enable('tag')
+  const msg = f.message('.tag', { key: ownerKey })
+  await Promise.all([f.deliver(msg), f.deliver(msg)])
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.calls[0].content.text, 'Usage: .tag <message>')
+  assert.equal(f.calls[0].content.mentions, undefined)
+  f.advance(); await f.send('.tag \n\t ', { key: ownerKey })
+  assert.equal(f.calls.length, 2)
+  f.configure(c => { c.prefix = '!' }); f.advance(); await f.send('!tag', { key: ownerKey })
+  assert.equal(f.calls.at(-1).content.text, 'Usage: !tag <message>')
+  assert(f.calls.every(c => !c.content.mentions && !c.content.text.includes('Group announcement')))
+})
+
+test('tag never retries an unconfirmed send when the event is replayed', async t => {
+  const f = fixture(t); f.enable('tag')
+  const original = f.socket.sendMessage.bind(f.socket)
+  let first = true
+  t.mock.method(f.socket, 'sendMessage', async (...args) => {
+    const result = await original(...args)
+    if (first) { first = false; throw Error('Synthetic unconfirmed delivery') }
+    return result
+  })
+  const msg = f.message('.tag One announcement', { key: ownerKey })
+  await f.deliver(msg); await f.restart(); f.advance(); await f.deliver(msg)
+  assert.equal(f.calls.filter(c => c.content.text === 'One announcement').length, 1)
+})
+
+test('tag replaces the old command in catalog, menus, help and execution', async t => {
+  const f = fixture(t); f.enable('tag')
+  assert.equal(COMMANDS.length, 23)
+  assert(COMMANDS.some(c => c.name === 'tag')); assert(!COMMANDS.some(c => c.name === 'hidetag'))
+  await f.send('.menu', { key: ownerKey })
+  assert.match(f.calls.at(-1).content.text, /\.tag /); assert.doesNotMatch(f.calls.at(-1).content.text, /hidetag/)
+  f.advance(); await f.send('.help tag', { key: ownerKey })
+  assert.match(f.calls.at(-1).content.text, /Usage: \.tag <message>/)
+  const count = f.calls.length
+  f.advance(); await f.send('.hidetag Old command', { key: ownerKey }); assert.equal(f.calls.length, count)
+})
+
+test('existing hidden-tag settings and statistics project to tag without modifying stored data', t => {
+  const f = fixture(t), legacy = accountDefaults()
+  delete legacy.commands.tag
+  legacy.commands.hidetag = { enabled: true, permission: 'permitted' }
+  legacy.prefix = '!'
+  const connection = new DatabaseSync(f.database)
+  try {
+    connection.prepare('INSERT INTO bot_command_settings VALUES(?,?,?,?)').run(workspace, accountId, 4, JSON.stringify(legacy))
+    f.store.statistic(workspace, accountId, 'hidetag', true)
+    f.store.statistic(workspace, accountId, 'hidetag', false)
+    f.store.statistic(workspace, accountId, 'tag', true)
+    const current = f.store.settings(workspace, accountId)
+    assert.equal(current.revision, 4); assert.equal(current.config.prefix, '!')
+    assert.deepEqual(current.config.commands.tag, { ...legacy.commands.hidetag, permission: 'owner' })
+    assert.equal(current.config.commands.hidetag, undefined)
+    assert.equal(Object.keys(current.config.commands).length, 23)
+    assert.equal(f.store.settings(otherWorkspace, accountId).config.commands.tag.enabled, false)
+    assert.deepEqual(f.store.statistics(workspace, accountId), [{ command: 'tag', successes: 2, failures: 1 }])
+    assert.equal(connection.prepare('SELECT config FROM bot_command_settings').get().config, JSON.stringify(legacy))
+    const saved = f.store.saveSettings(workspace, accountId, current.config, current.revision)
+    assert.deepEqual(saved.config.commands.tag, { ...legacy.commands.hidetag, permission: 'owner' })
+    const persisted = JSON.parse(connection.prepare('SELECT config FROM bot_command_settings').get().config)
+    assert.equal(persisted.commands.hidetag, undefined)
+    assert.deepEqual(persisted.commands.tag, { ...legacy.commands.hidetag, permission: 'owner' })
+    legacy.commands.tag = { enabled: false, permission: 'admin' }
+    connection.prepare('UPDATE bot_command_settings SET config=?').run(JSON.stringify(legacy))
+    assert.deepEqual(f.store.settings(workspace, accountId).config.commands.tag, { ...legacy.commands.tag, permission: 'owner' })
+  } finally { connection.close() }
 })
 test('antiword warns and deletes once; warning escalation and dashboard reset are scoped', async t => {
   const f = fixture(t); f.enable('antiword')
@@ -144,7 +264,8 @@ test('antilink allow-list matches exact domains/subdomains and catches prefixed 
   const f = fixture(t); f.enable('antilink')
   f.store.saveGroup(workspace, accountId, group, { antilink: true, allowedDomains: ['example.com'] })
   await f.send('https://docs.example.com/page'); assert.equal(f.calls.length, 0)
-  await f.send('.disabled https://example.com.evil.test/path'); assert.equal(f.store.warnings(workspace, accountId, group)[0].count, 1)
+  await f.send('.disabled https://example.com.evil.test/path'); assert.equal(f.calls.length, 0)
+  await f.send('https://example.com.evil.test/path'); assert.equal(f.store.warnings(workspace, accountId, group)[0].count, 1)
 })
 test('antispam exempts administrators, respects thresholds and cooldowns', async t => {
   const f = fixture(t); f.enable('antispam')
