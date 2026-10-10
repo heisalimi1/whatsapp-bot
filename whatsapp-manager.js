@@ -121,14 +121,64 @@ async function startEntry(entry, { pairing = false } = {}) {
     }
     const { version } = await versionProvider()
     if (stopping || !entry.wantConnection) throw makeError('WhatsApp connection manager is shutting down.')
-    const socket = socketFactory({ version, auth: state, browser: Browsers.macOS('Chrome'), logger: pino({ level: 'silent' }) })
+    // Cache only send-time metadata. Explicit permission checks always fetch fresh.
+    const groupCache = new Map(), groupFetches = new Map()
+    let metadataEpoch = 0, cacheClosed = false
+    const validGroup = jid => /^[0-9-]{5,80}@g\.us$/.test(String(jid || ''))
+    const rememberGroup = (jid, value, epoch) => {
+      if (cacheClosed || epoch !== metadataEpoch || !validGroup(jid) || value?.id !== jid || !Array.isArray(value.participants) || value.participants.length > 5000) return
+      groupCache.delete(jid)
+      groupCache.set(jid, { value, expires: Date.now() + 30000 })
+      if (groupCache.size > 256) groupCache.delete(groupCache.keys().next().value)
+    }
+    const invalidateGroup = jid => { metadataEpoch++; groupCache.delete(jid); groupFetches.delete(jid) }
+    let socket
+    const cachedGroupMetadata = async jid => {
+      if (cacheClosed || !validGroup(jid)) return undefined
+      const cached = groupCache.get(jid)
+      if (cached && cached.expires > Date.now()) return cached.value
+      groupCache.delete(jid)
+      if (typeof socket?.groupMetadata !== 'function') return undefined
+      if (groupFetches.has(jid)) return groupFetches.get(jid)
+      const epoch = metadataEpoch
+      const task = Promise.resolve().then(() => socket.groupMetadata(jid)).then(value => cacheClosed || epoch !== metadataEpoch ? undefined : groupCache.get(jid)?.value).finally(() => {
+        if (groupFetches.get(jid) === task) groupFetches.delete(jid)
+      })
+      groupFetches.set(jid, task)
+      return task
+    }
+    socket = socketFactory({ version, auth: state, browser: Browsers.macOS('Chrome'), logger: pino({ level: 'silent' }), cachedGroupMetadata })
+    if (typeof socket.groupMetadata === 'function') {
+      const fetchMetadata = socket.groupMetadata.bind(socket)
+      socket.groupMetadata = async jid => {
+        const epoch = metadataEpoch, value = await fetchMetadata(jid)
+        rememberGroup(jid, value, epoch)
+        return value
+      }
+    }
+    for (const method of ['groupParticipantsUpdate', 'groupSettingUpdate']) if (typeof socket[method] === 'function') {
+      const update = socket[method].bind(socket)
+      socket[method] = async (jid, ...args) => {
+        invalidateGroup(jid)
+        try { return await update(jid, ...args) }
+        finally { invalidateGroup(jid) }
+      }
+    }
     entry.sock = socket
     // Additive event bridge: one registration per socket, guarded against stale sockets.
     const messages = update => { if (entry.sock === socket && entry.status === 'connected' && !stopping) Promise.resolve().then(() => eventListener(socket, entry.id, 'messages.upsert', update)).catch(() => {}) }
-    const participants = update => { if (entry.sock === socket && entry.status === 'connected' && !stopping) Promise.resolve().then(() => eventListener(socket, entry.id, 'group-participants.update', update)).catch(() => {}) }
+    const participants = update => { if (entry.sock === socket && !stopping) { invalidateGroup(update?.id); if (entry.status === 'connected') Promise.resolve().then(() => eventListener(socket, entry.id, 'group-participants.update', update)).catch(() => {}) } }
+    const groups = updates => { if (entry.sock === socket && !stopping && Array.isArray(updates)) for (const update of updates) invalidateGroup(update?.id) }
+    const receiptBridge = name => update => { Promise.resolve().then(() => { if (entry.sock === socket && entry.status === 'connected' && !stopping) return eventListener(socket, entry.id, name, update) }).catch(() => {}) }
+    const updates = receiptBridge('messages.update'), receipts = receiptBridge('message-receipt.update'), connection = receiptBridge('connection.update')
     socket.ev.on('messages.upsert', messages)
     socket.ev.on('group-participants.update', participants)
-    entry.detachCommandEvents = () => { socket.ev.off?.('messages.upsert', messages); socket.ev.off?.('group-participants.update', participants) }
+    socket.ev.on('groups.update', groups)
+    socket.ev.on('groups.upsert', groups)
+    socket.ev.on('messages.update', updates)
+    socket.ev.on('message-receipt.update', receipts)
+    socket.ev.on('connection.update', connection)
+    entry.detachCommandEvents = () => { cacheClosed = true; groupCache.clear(); groupFetches.clear(); socket.ev.off?.('messages.upsert', messages); socket.ev.off?.('group-participants.update', participants); socket.ev.off?.('groups.update', groups); socket.ev.off?.('groups.upsert', groups); socket.ev.off?.('messages.update', updates); socket.ev.off?.('message-receipt.update', receipts); socket.ev.off?.('connection.update', connection) }
     entry.requiresPairing = !state.creds.registered
     setStatus(entry, entry.retries ? 'reconnecting' : 'connecting')
     let resolvePair, rejectPair

@@ -1,7 +1,7 @@
 const group = 'Group Administration', media = 'Media Tools', utility = 'WhatsApp Utilities'
 const definitions = [
   ['tagall', group, 'Mention every current group member.', 'tagall [message]', 'owner'],
-  ['tag', group, 'Send one message mentioning members without listing their names.', 'tag <message>', 'owner'],
+  ['tag', group, 'Tag text or a replied-to message once, then delete the command after confirmed delivery.', 'tag [message] (or reply to a message)', 'owner'],
   ['kick', group, 'Remove a mentioned or quoted member.', 'kick @member', 'owner'],
   ['promote', group, 'Promote a mentioned or quoted member.', 'promote @member', 'owner'],
   ['demote', group, 'Demote a mentioned or quoted administrator.', 'demote @member', 'owner'],

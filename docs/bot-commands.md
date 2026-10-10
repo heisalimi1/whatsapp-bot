@@ -92,10 +92,26 @@ placeholders, not real contacts or account identifiers:
 ```
 
 `.tag <message>` sends one message with hidden mentions of current group members,
-even in groups with more than 100 members. Without message text it replies with
-usage guidance and no mentions. Replayed command events and outgoing echoes are
+even in groups with more than 100 members. You can also reply to a group message
+with just `.tag`: it copies that message's text, or forwards an accessible image,
+video, document, audio/voice note or sticker with hidden mentions in the same
+single post. Media captions remain with the attachment; no extra caption message
+is sent. Explicit text after `.tag` takes precedence over a quoted message.
+Without text or a supported reply it gives usage guidance and no mentions.
+View-once content, protocol messages and cross-chat sources cannot be copied.
+Replayed command events and outgoing echoes are
 ignored using persistent receipts; unconfirmed sends are not retried. Existing
 hidden-tag settings and statistics appear under `.tag` without rewriting old data.
+After a confirmed send and a delivery/read receipt from another group recipient,
+the bot revokes only the original `.tag` or `.tag <message>` command for everyone.
+Both the replied-to source message and the tagged output remain. Server
+acknowledgements and receipts from the bot's own devices
+do not trigger cleanup. The command remains when sending fails or delivery stays
+unconfirmed. Deletion failure does not repost the message or add a group reply.
+Cleanup state is persisted in the existing SQLite database; reconnects can finish
+already-confirmed cleanup. Duplicate receipts use an atomic claim, with no automatic
+retry after an unconfirmed deletion. Cleanup accepts records for eight days;
+older records are pruned when preparing new tags, matching command receipts.
 `.tagall` keeps its visible member lists and bounded batches, with no generated
 "Group announcement" placeholder when no text is supplied.
 
@@ -153,7 +169,7 @@ Modified for this extension:
 
 - `bot.js`: service initialization, command routes/page, shared job validators,
   command job creation/cancellation and graceful shutdown.
-- `whatsapp-manager.js`: two guarded event listeners per existing socket, removed
+- `whatsapp-manager.js`: guarded command, receipt and connection listeners per existing socket, removed
   on close/disconnect; existing authentication/reconnect logic preserved.
 - `package.json`, `package-lock.json`: direct `sharp@0.35.5` (already the installed
   transitive version) and `ffmpeg-static@5.3.0`.
@@ -190,6 +206,16 @@ persists for ten minutes across restarts. Warning counts/settings do not expire.
 Command-created jobs are stored in the existing account automation JSON rather
 than a second job database. No WhatsApp credential migration is required.
 
+### Additive migration 4: tag command cleanup
+
+Startup adds `bot_tag_cleanup` and its expiry index to the same SQLite database.
+Rows are scoped by workspace/account and the outgoing tagged message ID. They
+contain the original owner command key, recipient identifiers, send/delivery flags
+and an atomic cleanup claim; message text and WhatsApp credentials are not stored
+in this table. Existing tables, accounts, settings and migrations are preserved.
+This pending feature requires a reviewed deployment of migration 4. Code rollback
+must retain the database and this table, so customer data is never reset.
+
 ## Security, reliability and performance
 
 - New APIs sit behind existing login, CSRF, workspace and account ownership
@@ -204,10 +230,20 @@ than a second job database. No WhatsApp credential migration is required.
 - Command output and known automation message IDs cannot create reply loops.
   Rate limits and cooldowns are account/chat scoped; private autoreplies also have
   their own cooldown. Normal non-command traffic does not generate denial spam.
-- Four event tasks and at most 64 accepted outstanding events are allowed.
-  Overflow is dropped without replying/replaying. Media uses one active task and
-  a total capacity of eight. Same-chat actions execute in order. Rate-tracking
-  maps are bounded to 5,000 entries. No extra perpetual timers/processes.
+- Four action workers and two basic-reply workers share a maximum of 64 accepted
+  outstanding events. Waiting same-chat actions acquire a worker only when the
+  previous action finishes; `.menu`, `.help`, `.ping` and `.alive` can reply while
+  media or group actions are running. Actions within a chat remain ordered, and
+  basic replies are ordered within their own lane. Overflow is dropped without
+  replying/replaying. Tag delivery cleanup runs alongside incoming dispatch.
+  Media uses one active task and a total capacity of eight. Rate-tracking maps
+  are bounded to 5,000 entries. Rejected repeats do not consume the command
+  allowance. Existing configured limits and cooldowns still apply.
+- Send-time group metadata is cached for 30 seconds, with at most 256 groups per
+  socket. Concurrent cache misses share a fetch. Membership/group changes and
+  local administrative actions invalidate it; disconnect discards the cache.
+  Explicit group membership and administrator checks always fetch fresh data.
+  No extra perpetual timers/processes are added.
 - Default media limits: 8 MB, 10 seconds, 25-second processing timeout; configurable
   ceilings: 16 MB, 30 seconds, 60 seconds. Images have a 16-million-pixel limit.
   Sharp cache/concurrency and FFmpeg threads are limited. Uploads have the existing
@@ -222,8 +258,10 @@ than a second job database. No WhatsApp credential migration is required.
 - Temporary files use generated private directories and are removed after upload,
   errors, timeouts, and normal shutdown. An OS crash/SIGKILL can leave an orphan
   in the OS temporary directory; no broad disk cleanup is attempted.
-- Errors expose safe user messages. Logs omit incoming content, numbers, group
-  IDs, URLs and raw exceptions. Dashboard command statistics expose aggregate
+- Errors expose safe user messages. Logs include fixed error categories and
+  timings for sends, metadata queries or commands taking at least one second;
+  they omit incoming content, numbers, group IDs, URLs and raw exceptions.
+  Dashboard command statistics expose aggregate
   successes/failures without raw messages.
 
 Moderation/welcome availability still depends on connected sockets and actual
@@ -299,7 +337,7 @@ for this feature.
 
 After approval, roll back code/dependencies through the existing deployment
 workflow to the prior reviewed commit. Preserve `.env`, SQLite, all account data,
-media and WhatsApp credential directories. Old code can ignore the seven new
+media and WhatsApp credential directories. Old code can ignore the command
 tables and migration record; leaving them present preserves settings for a later
 re-upgrade. Do not restore an older whole authentication database, which could
 discard newer users/sessions/business records.
@@ -314,6 +352,7 @@ directories as a rollback procedure.
 ## Primary implementation references
 
 - [Baileys event types](https://github.com/WhiskeySockets/Baileys/blob/master/src/Types/Events.ts)
+- [Baileys delivery and group receipt events](https://github.com/WhiskeySockets/baileys.wiki-site/blob/main/docs/socket/receiving-updates.md)
 - [Sharp output/conversion API](https://sharp.pixelplumbing.com/api-output/)
 - [FFmpeg protocol restrictions](https://ffmpeg.org/ffmpeg-protocols.html)
 - [ffmpeg-static installation and binary licensing](https://github.com/eugeneware/ffmpeg-static)

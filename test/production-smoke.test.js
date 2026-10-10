@@ -212,7 +212,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert.equal((await fetch(commandUrl)).status, 401, 'command settings require dashboard authentication')
   const initialCommands = await (await fetch(commandUrl, { headers: messageHeaders })).json()
   assert.equal(initialCommands.catalog.length, 23)
-  assert(initialCommands.catalog.some(c => c.name === 'tag' && c.usage === 'tag <message>'))
+  assert(initialCommands.catalog.some(c => c.name === 'tag' && c.usage === 'tag [message] (or reply to a message)'))
   assert(!initialCommands.catalog.some(c => c.name === 'hidetag'))
   assert.equal(initialCommands.config.commands.tag.enabled, false)
   assert.equal(initialCommands.config.commands.hidetag, undefined)

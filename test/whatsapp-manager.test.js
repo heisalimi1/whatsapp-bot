@@ -28,8 +28,12 @@ function fixture(t, overrides = {}) {
       const state = { creds: fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : { registered: false }, keys: {} }
       return { state, async saveCreds() { fs.writeFileSync(file, JSON.stringify(state.creds)) } }
     },
-    socketFactory({ auth: state }) {
-      const socket = { ev: new EventEmitter(), state, pairingCalls: 0,
+    socketFactory(options) {
+      const { auth: state } = options
+      const socket = { ev: new EventEmitter(), state, options, pairingCalls: 0, metadataRequests: 0,
+        async groupMetadata(jid) { socket.metadataRequests++; return { id: jid, participants: [] } },
+        async groupParticipantsUpdate() { return [{ status: '200' }] },
+        async groupSettingUpdate() {},
         async requestPairingCode() { socket.pairingCalls++; return 'TEST-CODE' },
         async end() { socket.ev.emit('connection.update', { connection: 'close' }) },
         async logout() { socket.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { statusCode: 401 } } }) }
@@ -45,6 +49,73 @@ function fixture(t, overrides = {}) {
   return { root, auth, sockets, authPaths, make }
 }
 
+test('send metadata is reused while explicit permission queries stay fresh and events invalidate it', async t => {
+  const f = fixture(t), manager = f.make(), jid = '120363000000000001@g.us'
+  await manager.listAccounts(owner); await until(() => f.sockets.length === 1)
+  const socket = f.sockets[0]; socket.ev.emit('connection.update', { connection: 'open' })
+  const cached = socket.options.cachedGroupMetadata
+  const first = await socket.groupMetadata(jid)
+  assert.equal(await cached(jid), first); assert.equal(socket.metadataRequests, 1)
+  await socket.groupMetadata(jid)
+  assert.equal(socket.metadataRequests, 2, 'administration cannot rely on old cached permissions')
+  await Promise.all([cached(jid), cached(jid), cached(jid)])
+  assert.equal(socket.metadataRequests, 2)
+  for (const event of ['group-participants.update', 'groups.update', 'groups.upsert']) {
+    const before = socket.metadataRequests
+    socket.ev.emit(event, event === 'group-participants.update' ? { id: jid, action: 'remove', participants: [] } : [{ id: jid }])
+    await cached(jid); assert.equal(socket.metadataRequests, before + 1)
+  }
+  for (const method of ['groupParticipantsUpdate', 'groupSettingUpdate']) {
+    const before = socket.metadataRequests
+    await socket[method](jid, [], 'remove')
+    await cached(jid); assert.equal(socket.metadataRequests, before + 1)
+  }
+  assert.equal(await cached('status@broadcast'), undefined)
+  await manager.disconnectAccount(accountId)
+  assert.equal(socket.ev.listenerCount('groups.update'), 0)
+  assert.equal(socket.ev.listenerCount('groups.upsert'), 0)
+  assert.equal(await cached(jid), undefined, 'closed sockets never reuse metadata or start queries')
+})
+
+test('send metadata expires, stays bounded, and concurrent misses share a single query', async t => {
+  let clock = Date.now(); t.mock.method(Date, 'now', () => clock)
+  const f = fixture(t), manager = f.make(), jid = '120363000000000001@g.us'
+  await manager.listAccounts(owner); await until(() => f.sockets.length === 1)
+  const socket = f.sockets[0], cached = socket.options.cachedGroupMetadata
+  await Promise.all(Array.from({ length: 10 }, () => cached(jid)))
+  assert.equal(socket.metadataRequests, 1)
+  clock += 30001; await cached(jid); assert.equal(socket.metadataRequests, 2)
+  for (let index = 0; index < 256; index++) await cached(`${120363000001000000n + BigInt(index)}@g.us`)
+  const before = socket.metadataRequests
+  await cached(jid); assert.equal(socket.metadataRequests, before + 1, 'the oldest group is evicted')
+})
+
+test('metadata changed during a query cannot enter the send cache, which is isolated per socket', async t => {
+  const gate = Promise.withResolvers(), started = Promise.withResolvers(), sockets = []
+  const f = fixture(t, { socketFactory(options) {
+    const socket = { ev: new EventEmitter(), options, metadataRequests: 0,
+      async groupMetadata(jid) {
+        socket.metadataRequests++
+        if (sockets.length === 1 && socket.metadataRequests === 1) { started.resolve(); await gate.promise }
+        return { id: jid, participants: [] }
+      },
+      async end() { socket.ev.emit('connection.update', { connection: 'close' }) }
+    }
+    sockets.push(socket); return socket
+  } }), manager = f.make(), jid = '120363000000000001@g.us'
+  await manager.listAccounts(owner); await until(() => sockets.length === 1)
+  const first = sockets[0]
+  const pending = first.options.cachedGroupMetadata(jid)
+  await started.promise
+  first.ev.emit('groups.update', [{ id: jid }])
+  gate.resolve(); assert.equal(await pending, undefined)
+  await first.options.cachedGroupMetadata(jid); assert.equal(first.metadataRequests, 2)
+  await manager.disconnectAccount(accountId); await manager.reconnectAccount(accountId)
+  const second = sockets[1]
+  await second.options.cachedGroupMetadata(jid); assert.equal(second.metadataRequests, 1)
+  assert.equal(await first.options.cachedGroupMetadata(jid), undefined)
+})
+
 test('command event listeners attach once, detach on disconnect, and ignore replaced sockets', async t => {
   const f = fixture(t), manager = f.make(), events = []
   manager.onAccountEvent((socket, id, name, update) => events.push({ socket, id, name, update }))
@@ -54,22 +125,31 @@ test('command event listeners attach once, detach on disconnect, and ignore repl
   await delay(5); assert.equal(events.length, 0, 'Unconnected sockets do not route commands')
   first.ev.emit('connection.update', { connection: 'open' })
   first.ev.emit('connection.update', { connection: 'open' })
+  await until(() => events.filter(event => event.name === 'connection.update').length === 2)
   assert.equal(first.ev.listenerCount('messages.upsert'), 1)
   assert.equal(first.ev.listenerCount('group-participants.update'), 1)
+  assert.equal(first.ev.listenerCount('messages.update'), 1)
+  assert.equal(first.ev.listenerCount('message-receipt.update'), 1)
   first.ev.emit('messages.upsert', { type: 'notify', messages: [] })
   first.ev.emit('group-participants.update', { action: 'add', participants: [] })
-  await until(() => events.length === 2)
+  first.ev.emit('messages.update', [])
+  first.ev.emit('message-receipt.update', [])
+  await until(() => events.filter(event => event.name !== 'connection.update').length === 4)
   assert(events.every(event => event.socket === first && event.id === accountId))
   await manager.disconnectAccount(accountId)
   assert.equal(first.ev.listenerCount('messages.upsert'), 0)
   assert.equal(first.ev.listenerCount('group-participants.update'), 0)
+  assert.equal(first.ev.listenerCount('messages.update'), 0)
+  assert.equal(first.ev.listenerCount('message-receipt.update'), 0)
   await manager.reconnectAccount(accountId)
   const second = f.sockets[1]; second.ev.emit('connection.update', { connection: 'open' })
   first.ev.emit('messages.upsert', { type: 'notify', messages: [] })
   second.ev.emit('messages.upsert', { type: 'notify', messages: [] })
-  await until(() => events.length === 3)
-  assert.equal(events[2].socket, second)
+  await until(() => events.filter(event => event.name !== 'connection.update').length === 5)
+  assert.equal(events.filter(event => event.name !== 'connection.update')[4].socket, second)
   assert.equal(second.ev.listenerCount('messages.upsert'), 1)
+  assert.equal(second.ev.listenerCount('messages.update'), 1)
+  assert.equal(second.ev.listenerCount('message-receipt.update'), 1)
   assert.equal(fs.readFileSync(path.join(f.auth, 'session-marker'), 'utf8'), 'original-session-fixture')
 })
 

@@ -37,13 +37,18 @@ Send `.menu`, `.tag Test announcement` and other commands from a different
 test-group member or a private chat: there should be no reply or command action,
 even when that member is an administrator. Commands cannot be delegated.
 The default command cooldown is five seconds for repeat uses of the same command.
+Repeats rejected during that cooldown do not use the allowance for other commands.
+While a sticker or group action is processing, send `.ping` or `.menu`: its reply
+should not wait for that action. Actions that change the same group remain ordered.
+Actual phone delivery still depends on WhatsApp connectivity; the private server
+log records a safe timing summary when sending or processing takes over one second.
 
 ## Checklist for all 23 commands
 
 | Commands | Test and expected result |
 | --- | --- |
 | `.menu`, `.help`, `.ping`, `.alive` | Menu lists enabled commands, help explains usage, ping returns Pong, alive reports the connection. Try `.help antiword`. |
-| `.tagall`, `.tag` | Send `.tagall Test announcement` and `.tag Test announcement` in the spare-account test group. `.tag` sends the text once with hidden mentions, including for groups over 100 members. Send `.tag` without text: only usage guidance should appear, with no mentions. `.tagall` keeps visible member lists in batches. |
+| `.tagall`, `.tag` | Send `.tagall Test announcement` and `.tag Test announcement` in the spare-account test group. Also reply to a tester's text or accessible image/video/document/audio/sticker using only `.tag`; the original text or attachment should be copied once with hidden mentions, keeping media captions. Once another member's device confirms delivery, only your `.tag` command should be deleted for everyone; the replied-to message and tagged output stay. Without confirmed delivery the command stays. Send `.tag` with neither text nor a reply: only usage guidance should appear, with no mentions. `.tagall` keeps visible member lists in batches. |
 | `.promote`, `.demote` | Mention/reply to a willing test member, promote them, then demote them. Verify permissions in WhatsApp. The bot and group founder are protected. |
 | `.mute`, `.unmute` | Mute the test group; a non-admin cannot post. Unmute it and verify they can post again. |
 | `.kick` | Mention/reply to a disposable non-admin test member. Verify removal, then invite them back when desired. |

@@ -1,12 +1,15 @@
 import crypto from 'node:crypto'
+import { WAMessageStatus } from '@whiskeysockets/baileys'
 import { COMMANDS, COMMAND_BY_NAME, adminActions } from './catalog.js'
 import { userJid, groupJid, matchesPhrase, unauthorizedLink } from './settings.js'
-import { containsViewOnce, mediaFrom, MediaError, BoundedQueue } from './media.js'
+import { containsViewOnce, mediaFrom, validateMediaLocation, MediaError, BoundedQueue } from './media.js'
 
-export class CommandError extends Error {}
+export class CommandError extends Error {
+  constructor(message, code = 'command-error') { super(message); this.code = code }
+}
 const timeout = (promise, milliseconds = 20000) => {
   let timer
-  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new CommandError('WhatsApp did not confirm the request. It will not be retried automatically.')), milliseconds) })]).finally(() => clearTimeout(timer))
+  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new CommandError('WhatsApp did not confirm the request. It will not be retried automatically.', 'whatsapp-timeout')), milliseconds) })]).finally(() => clearTimeout(timer))
 }
 class BoundedMap extends Map {
   constructor(limit = 5000) { super(); this.limit = limit }
@@ -21,23 +24,133 @@ function parseMessage(message) {
   return { text, info, body }
 }
 export function createCommandEngine({ store, getAccount, getSocket, media, services, now = Date.now, log = () => {} }) {
-  const queue = new BoundedQueue(4, 64), rates = new BoundedMap(), cooldowns = new BoundedMap(), spam = new BoundedMap(), serial = new Map()
-  let stopped = false
+  const queue = new BoundedQueue(4, 64), basicQueue = new BoundedQueue(2, 64)
+  const rates = new BoundedMap(), cooldowns = new BoundedMap(), spam = new BoundedMap(), serial = new Map(), cleanupTasks = new Set()
+  let stopped = false, outstanding = 0
+  function slowTiming(label, started) {
+    const elapsed = Math.round(performance.now() - started)
+    if (elapsed >= 1000) log('Bot command timing:', label, elapsed, 'ms')
+  }
+  function trackCleanup(work) {
+    if (stopped) return Promise.resolve()
+    const task = Promise.resolve().then(work).finally(() => cleanupTasks.delete(task))
+    cleanupTasks.add(task); return task
+  }
   function allow(key, limit, window) {
     const times = (rates.get(key) || []).filter(time => now() - time < window)
     if (times.length >= limit) return false
     times.push(now()); rates.set(key, times); return true
   }
-  function cooldown(key, seconds) { if (now() - (cooldowns.get(key) || 0) < seconds * 1000) return false; cooldowns.set(key, now()); return true }
+  function cooldown(key, seconds) { const previous = cooldowns.get(key); if (previous !== undefined && now() - previous < seconds * 1000) return false; cooldowns.set(key, now()); return true }
+  function admitCommand(context, name) {
+    const { config, account, chat, sender } = context, current = now()
+    const key = `command:${account.id}:${chat}:${sender}:${name}`, previous = cooldowns.get(key)
+    if (previous !== undefined && current - previous < config.cooldownSeconds * 1000) throw new CommandError('The previous command is still within its cooldown. Please wait a moment.', 'command-cooldown')
+    const limits = [[`account:${account.id}`, config.perAccountPerMinute, 'account-limit'], [`chat:${account.id}:${chat}`, config.perChatPerMinute, 'chat-limit']]
+    const windows = limits.map(([rateKey, limit, code]) => {
+      const times = (rates.get(rateKey) || []).filter(time => current - time < 60000)
+      if (times.length >= limit) throw new CommandError('The configured command limit has been reached. Check the account and chat limits in Bot Commands settings.', code)
+      return [rateKey, times]
+    })
+    // Rejected repeat attempts must not consume the account/chat allowance.
+    for (const [rateKey, times] of windows) { times.push(current); rates.set(rateKey, times) }
+    cooldowns.set(key, current)
+  }
   async function checkedSocket(context) {
     if (stopped || await getSocket(context.account.id) !== context.socket) throw new CommandError('WhatsApp connection changed. Please try a new command after reconnecting.')
     return context.socket
   }
-  async function send(context, content) {
+  async function send(context, content, beforeSend) {
     const socket = await checkedSocket(context), id = crypto.randomUUID().replace(/-/g, '').toUpperCase()
     // Claim outgoing identifiers before sending; delivery echoes cannot execute commands.
     store.claim(context.account.workspaceId, context.account.id, `message:${context.chat}:${id}`)
-    return timeout(socket.sendMessage(context.chat, content, { messageId: id }))
+    beforeSend?.(id)
+    const started = performance.now()
+    try { return await timeout(socket.sendMessage(context.chat, content, { messageId: id })) }
+    finally { slowTiming('WhatsApp send', started) }
+  }
+  async function finishTagCleanup(account, socket, id) {
+    const pending = store.tagCleanup(account.workspaceId, account.id, id)
+    if (!pending?.sendConfirmed || !pending.deliveryConfirmed || pending.key?.fromMe !== true || !groupJid(pending.key.remoteJid) || !pending.key.id) return
+    if (stopped || await getSocket(account.id) !== socket) return
+    // Claim before the revoke request; duplicate receipts cannot delete twice.
+    const claimed = store.claimTagCleanup(account.workspaceId, account.id, id)
+    if (!claimed) return
+    try { await send({ account, socket, chat: claimed.key.remoteJid }, { delete: claimed.key }) }
+    catch { log('Tag command cleanup was not confirmed; the original command may remain.') }
+  }
+  async function tagReceipts(socket, accountId, updates) {
+    if (stopped || !Array.isArray(updates) || await getSocket(accountId) !== socket) return
+    const account = await getAccount(accountId)
+    if (!account?.workspaceId) return
+    for (const item of updates.slice(0, 256)) {
+      if (stopped) return
+      if (item?.key?.fromMe !== true || !item.key.id) continue
+      const pending = store.tagCleanup(account.workspaceId, accountId, item.key.id)
+      if (!pending || pending.key.remoteJid !== item.key.remoteJid) continue
+      const status = item.update?.status ?? item.status
+      if (status === WAMessageStatus.ERROR) { store.cancelTagCleanup(account.workspaceId, accountId, item.key.id); continue }
+      const aggregateDelivery = [WAMessageStatus.DELIVERY_ACK, WAMessageStatus.READ, WAMessageStatus.PLAYED].includes(status)
+      const receipts = item.receipt ? [item.receipt] : Array.isArray(item.userReceipt) ? item.userReceipt : []
+      let recipientDelivery = false
+      if (!aggregateDelivery) for (const receipt of receipts) {
+        const recipient = userJid(receipt.userJid)
+        if (!recipient || ![receipt.receiptTimestamp, receipt.readTimestamp, receipt.playedTimestamp].some(value => Number.isFinite(Number(value)) && Number(value) > 0)) continue
+        if (pending.recipients.includes(recipient) || [...await aliases(socket, recipient)].some(jid => pending.recipients.includes(jid))) { recipientDelivery = true; break }
+      }
+      if (!aggregateDelivery && !recipientDelivery) continue
+      store.confirmTagDelivery(account.workspaceId, accountId, item.key.id)
+      await finishTagCleanup(account, socket, item.key.id)
+    }
+  }
+  function tagContent(context, argument) {
+    if (argument) return { text: argument }
+    const usage = `Usage: ${context.config.prefix}tag <message>, or reply to a message with ${context.config.prefix}tag.`
+    let quoted = context.info.quotedMessage
+    if (!quoted) throw new CommandError(usage)
+    if (context.info.remoteJid && context.info.remoteJid !== context.chat) throw new CommandError('Reply to a message in this group to tag it.')
+    // Unwrap only normal disappearing/document captions; never copy view-once
+    // content or accept protocol/edit wrappers as a tagging source.
+    for (let depth = 0; depth < 5; depth++) {
+      if (containsViewOnce(quoted)) throw new CommandError('View-once messages cannot be tagged or copied.')
+      const inner = quoted?.ephemeralMessage || quoted?.documentWithCaptionMessage
+      if (!inner) break
+      quoted = inner.message
+    }
+    if (!quoted || containsViewOnce(quoted)) throw new CommandError('Reply to an accessible text or media message to tag it.')
+    const text = typeof quoted.conversation === 'string' ? quoted.conversation : quoted.extendedTextMessage?.text
+    if (typeof text === 'string' && text.trim()) {
+      if (text.length > 12000) throw new CommandError(`The replied-to text is too long. Use ${context.config.prefix}tag with a shorter message.`)
+      return { text }
+    }
+    for (const type of ['imageMessage', 'videoMessage', 'documentMessage', 'audioMessage', 'stickerMessage']) {
+      if (!quoted[type] || typeof quoted[type] !== 'object') continue
+      validateMediaLocation(quoted[type])
+      if (Buffer.from(quoted[type].mediaKey || []).length !== 32) throw new CommandError('This replied-to media is unavailable. Send a fresh attachment and reply to it with the tag command.')
+      // Baileys forwards the existing WhatsApp media envelope; no extra download,
+      // upload, temporary file or duplicate caption reply is needed.
+      return { forward: { key: { remoteJid: context.chat, fromMe: false, id: context.info.stanzaId || context.message.key.id }, message: { [type]: quoted[type] } } }
+    }
+    throw new CommandError(usage)
+  }
+  async function sendTag(context, content, mentions) {
+    const self = new Set([userJid(context.socket.user?.id), userJid(context.socket.user?.lid)].filter(Boolean))
+    for (const jid of await aliases(context.socket, context.socket.user?.id)) self.add(jid)
+    const ownMember = participant(context, self)
+    for (const jid of [ownMember?.id, ownMember?.phoneNumber, ownMember?.lid].map(userJid).filter(Boolean)) self.add(jid)
+    const recipients = [...new Set(context.metadata.participants.flatMap(member => [member.id, member.phoneNumber, member.lid].map(userJid).filter(jid => jid && !self.has(jid))))]
+    let id
+    try {
+      const result = await send(context, { ...content, mentions }, value => {
+        id = value; store.prepareTagCleanup(context.account.workspaceId, context.account.id, id, { ...context.message.key }, recipients)
+      })
+      if (result?.key?.id !== id) throw new CommandError('WhatsApp did not confirm the tagged message. The original command is preserved.')
+      store.confirmTagSend(context.account.workspaceId, context.account.id, id)
+    } catch (error) {
+      if (id) store.cancelTagCleanup(context.account.workspaceId, context.account.id, id)
+      throw error
+    }
+    await finishTagCleanup(context.account, context.socket, id)
   }
   const reply = (context, text) => send(context, { text: String(text).slice(0, 12000) })
   async function aliases(socket, jid) {
@@ -54,8 +167,10 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     if (!groupJid(context.chat)) throw new CommandError('This command is available in WhatsApp groups only.')
     if (!context.metadata) {
       await checkedSocket(context)
+      const started = performance.now()
       try { context.metadata = await timeout(context.socket.groupMetadata(context.chat)) }
-      catch { throw new CommandError('Could not verify this group’s current participants and permissions.') }
+      catch { throw new CommandError('Could not verify this group’s current participants and permissions.', 'group-metadata-error') }
+      finally { slowTiming('group metadata', started) }
       if (!context.metadata || context.metadata.id !== context.chat || !Array.isArray(context.metadata.participants) || context.metadata.participants.length > 5000) throw new CommandError('Could not verify this group.')
     }
     return context.metadata
@@ -133,7 +248,7 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
       await metadata(context)
       if (adminActions.has(name)) await requireAdmin(context, ['kick', 'promote', 'demote', 'mute', 'unmute'].includes(name))
       if (name === 'tagall' || name === 'tag') {
-        if (name === 'tag' && !argument) throw new CommandError(`Usage: ${config.prefix}tag <message>`)
+        const content = name === 'tag' ? tagContent(context, argument) : undefined
         const identities = new Map()
         for (const member of context.metadata.participants) {
           const jid = userJid(member.id), canonical = userJid(member.phoneNumber) || jid
@@ -143,7 +258,7 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
         if (name === 'tag') {
           // Hidden mentions share one message, regardless of the group size.
           // The persistent incoming receipt prevents replay after reconnect/restart.
-          await send(context, { text: argument, mentions: members })
+          await sendTag(context, content, members)
         } else for (let offset = 0; offset < members.length; offset += 100) {
           // Visible member lists remain bounded to keep each text readable.
           const batch = members.slice(offset, offset + 100)
@@ -236,7 +351,7 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     }
     return true
   }
-  async function handle(accountId, socket, message) {
+  async function handle(accountId, socket, message, queuedAt = performance.now()) {
     if (stopped || !message?.key?.id || !message.message || message.key.remoteJid === 'status@broadcast') return
     const chat = message.key.remoteJid
     if (!groupJid(chat) && !userJid(chat)) return
@@ -265,6 +380,8 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     }
     if (!isCommand && !config.commands.autoreply.enabled && !['antilink', 'antiword', 'antispam'].some(c => config.commands[c].enabled)) return
     if (!store.claim(account.workspaceId, accountId, `message:${chat}:${message.key.id}`)) return
+    if (isCommand) slowTiming(`${name} queue wait`, queuedAt)
+    const started = performance.now()
     try {
       if (!isCommand) {
         if (groupJid(chat) && await moderate(context)) return
@@ -274,17 +391,17 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
         }
         return
       }
-      if (!allow(`account:${accountId}`, config.perAccountPerMinute, 60000) || !allow(`chat:${accountId}:${chat}`, config.perChatPerMinute, 60000) || !cooldown(`command:${accountId}:${chat}:${sender}:${name}`, config.cooldownSeconds)) throw new CommandError('The previous command is still within its cooldown. Please wait a moment.')
+      admitCommand(context, name)
       await execute(context, name, argument)
       store.statistic(account.workspaceId, accountId, name, true)
     } catch (error) {
       if (name) store.statistic(account.workspaceId, accountId, name, false)
       // Do not log messages, group identifiers, phone numbers, download URLs or raw exceptions.
-      log('Bot command failed:', name || 'moderation')
+      log('Bot command failed:', name || 'moderation', error instanceof CommandError ? error.code : error instanceof MediaError ? 'media-error' : 'whatsapp-error')
       if (allow(`error:${accountId}:${chat}`, 3, 60000)) {
         try { await reply(context, error instanceof CommandError || error instanceof MediaError ? error.message : 'The command could not be completed. Check its settings and WhatsApp permissions.') } catch {}
       }
-    }
+    } finally { if (name) slowTiming(`${name} execution`, started) }
   }
   async function welcome(accountId, socket, update) {
     if (stopped || update?.action !== 'add' || !groupJid(update.id) || !Array.isArray(update.participants)) return
@@ -306,25 +423,37 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     }
   }
   function enqueue(accountId, socket, event, payload) {
-    if (stopped || queue.active + queue.pending.length >= queue.capacity) return Promise.resolve(false)
+    if (stopped || outstanding >= 64) return Promise.resolve(false)
     const chat = event === 'messages.upsert' ? payload.key?.remoteJid : payload.id
-    const key = `${accountId}:${chat}`, previous = serial.get(key) || Promise.resolve()
-    const task = queue.run(async () => {
-      await previous.catch(() => {})
-      if (event === 'messages.upsert') await handle(accountId, socket, payload)
+    const basic = event === 'messages.upsert' && payload.key?.fromMe === true && /^[.!#/$?+~_-]{1,4}(?:menu|help|ping|alive)(?:\s|$)/i.test(parseMessage(payload)?.text || '')
+    const target = basic ? basicQueue : queue, queuedAt = performance.now()
+    const key = `${accountId}:${chat}:${basic ? 'basic' : 'actions'}`, previous = serial.get(key) || Promise.resolve()
+    outstanding++
+    // Wait for this chat before acquiring a worker, so other chats remain ready.
+    const task = previous.catch(() => {}).then(() => stopped ? undefined : target.run(async () => {
+      if (event === 'messages.upsert') await handle(accountId, socket, payload, queuedAt)
       else await welcome(accountId, socket, payload)
-    }).catch(() => { log('Bot event processing failed.') }).finally(() => { if (serial.get(key) === task) serial.delete(key) })
+    })).catch(() => { log('Bot event processing failed.') }).finally(() => { outstanding--; if (serial.get(key) === task) serial.delete(key) })
     serial.set(key, task); return task
   }
   return {
     async onEvent(socket, accountId, event, update) {
+      if (event === 'messages.update' || event === 'message-receipt.update') return trackCleanup(() => tagReceipts(socket, accountId, update))
+      if (event === 'connection.update' && update?.connection === 'open') return trackCleanup(async () => {
+        if (stopped || await getSocket(accountId) !== socket) return
+        const account = await getAccount(accountId)
+        if (account?.workspaceId) for (const pending of store.readyTagCleanups(account.workspaceId, accountId)) await finishTagCleanup(account, socket, pending.id)
+        return
+      })
       if (event === 'messages.upsert') {
-        if (update.type !== 'notify' || !Array.isArray(update.messages)) return
+        const cleanup = trackCleanup(() => tagReceipts(socket, accountId, update?.messages))
+        if (update?.type !== 'notify' || !Array.isArray(update.messages)) return cleanup
         // Bounded event batch; over-capacity work is dropped without replying or re-execution.
-        await Promise.all(update.messages.slice(0, 64).map(message => enqueue(accountId, socket, event, message)))
+        // Receipt revocation runs alongside dispatch, never ahead of a new command.
+        await Promise.all([cleanup, ...update.messages.slice(0, 64).filter(message => message?.key).map(message => enqueue(accountId, socket, event, message))])
       } else if (event === 'group-participants.update') await enqueue(accountId, socket, event, update)
     },
-    async stop() { stopped = true; media.stop?.(); await Promise.allSettled([...serial.values()]) },
-    metrics() { return { active: queue.active, queued: queue.pending.length } }
+    async stop() { stopped = true; media.stop?.(); await Promise.allSettled([...serial.values(), ...cleanupTasks]) },
+    metrics() { const active = queue.active + basicQueue.active; return { active, queued: Math.max(0, outstanding - active) } }
   }
 }

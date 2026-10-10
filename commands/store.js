@@ -22,8 +22,11 @@ export function createCommandStore(databasePath, { now = Date.now } = {}) {
     CREATE TABLE IF NOT EXISTS bot_command_statistics(workspace_id TEXT NOT NULL,account_id TEXT NOT NULL,command TEXT NOT NULL,successes INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workspace_id,account_id,command));
     CREATE TABLE IF NOT EXISTS bot_welcome_receipts(workspace_id TEXT NOT NULL,account_id TEXT NOT NULL,group_jid TEXT NOT NULL,member_jid TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,account_id,group_jid,member_jid));
     CREATE TABLE IF NOT EXISTS bot_broadcast_confirmations(workspace_id TEXT NOT NULL,account_id TEXT NOT NULL,token_hash TEXT NOT NULL,chat TEXT NOT NULL,payload TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(workspace_id,account_id,token_hash));
+    CREATE TABLE IF NOT EXISTS bot_tag_cleanup(workspace_id TEXT NOT NULL,account_id TEXT NOT NULL,outgoing_id TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,send_confirmed INTEGER NOT NULL DEFAULT 0,delivery_confirmed INTEGER NOT NULL DEFAULT 0,claimed INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workspace_id,account_id,outgoing_id));
+    CREATE INDEX IF NOT EXISTS bot_tag_cleanup_expiry ON bot_tag_cleanup(created_at);
   `)
   db.prepare('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?)').run(now())
+  db.prepare('INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(4,?)').run(now())
   const scope = (workspaceId, accountId) => { if (!uuid.test(workspaceId || '') || !uuid.test(accountId || '')) throw Error('Invalid command account scope.'); return [workspaceId, accountId] }
   const transaction = fn => { db.exec('BEGIN IMMEDIATE'); try { const result = fn(); db.exec('COMMIT'); return result } catch (e) { db.exec('ROLLBACK'); throw e } }
   function settings(w, a) {
@@ -74,6 +77,23 @@ export function createCommandStore(databasePath, { now = Date.now } = {}) {
     return db.prepare('INSERT OR IGNORE INTO bot_command_receipts VALUES(?,?,?,?)').run(...scope(w, a), hash, now()).changes === 1
   }
   return { settings, saveSettings, group, saveGroup, warn, claim,
+    prepareTagCleanup(w, a, id, key, recipients) {
+      if (typeof id !== 'string' || !id || id.length > 128 || key?.fromMe !== true || typeof key.id !== 'string' || !key.id || key.id.length > 128 || !groupJid(key.remoteJid) || !Array.isArray(recipients) || recipients.some(jid => !userJid(jid))) throw Error('Invalid tag cleanup.')
+      db.prepare('DELETE FROM bot_tag_cleanup WHERE created_at<?').run(now() - 8 * 86400000)
+      db.prepare('INSERT INTO bot_tag_cleanup(workspace_id,account_id,outgoing_id,payload,created_at) VALUES(?,?,?,?,?)').run(...scope(w, a), id, JSON.stringify({ key, recipients: [...new Set(recipients)] }), now())
+    },
+    tagCleanup(w, a, id) {
+      const row = db.prepare('SELECT payload,send_confirmed,delivery_confirmed FROM bot_tag_cleanup WHERE workspace_id=? AND account_id=? AND outgoing_id=? AND claimed=0 AND created_at>=?').get(...scope(w, a), id, now() - 8 * 86400000)
+      return row && { ...JSON.parse(row.payload), sendConfirmed: !!row.send_confirmed, deliveryConfirmed: !!row.delivery_confirmed }
+    },
+    confirmTagSend(w, a, id) { db.prepare('UPDATE bot_tag_cleanup SET send_confirmed=1 WHERE workspace_id=? AND account_id=? AND outgoing_id=? AND claimed=0').run(...scope(w, a), id) },
+    confirmTagDelivery(w, a, id) { db.prepare('UPDATE bot_tag_cleanup SET delivery_confirmed=1 WHERE workspace_id=? AND account_id=? AND outgoing_id=? AND claimed=0').run(...scope(w, a), id) },
+    cancelTagCleanup(w, a, id) { db.prepare('UPDATE bot_tag_cleanup SET claimed=1 WHERE workspace_id=? AND account_id=? AND outgoing_id=?').run(...scope(w, a), id) },
+    claimTagCleanup(w, a, id) {
+      const row = db.prepare('UPDATE bot_tag_cleanup SET claimed=1 WHERE workspace_id=? AND account_id=? AND outgoing_id=? AND send_confirmed=1 AND delivery_confirmed=1 AND claimed=0 AND created_at>=? RETURNING payload').get(...scope(w, a), id, now() - 8 * 86400000)
+      return row && JSON.parse(row.payload)
+    },
+    readyTagCleanups(w, a) { return db.prepare('SELECT outgoing_id AS id FROM bot_tag_cleanup WHERE workspace_id=? AND account_id=? AND send_confirmed=1 AND delivery_confirmed=1 AND claimed=0 AND created_at>=? LIMIT 100').all(...scope(w, a), now() - 8 * 86400000) },
     warnings(w, a, jid) { return db.prepare('SELECT member_jid AS member,count,updated_at AS updatedAt FROM bot_warnings WHERE workspace_id=? AND account_id=? AND group_jid=? ORDER BY updated_at DESC LIMIT 1000').all(...scope(w, a), jid) },
     resetWarnings(w, a, jid, member) { if (!groupJid(jid) || !userJid(member)) throw Error('Invalid warning target.'); db.prepare('DELETE FROM bot_warnings WHERE workspace_id=? AND account_id=? AND group_jid=? AND member_jid=?').run(...scope(w, a), jid, userJid(member)) },
     welcome(w, a, jid, member) {
