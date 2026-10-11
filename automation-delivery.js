@@ -35,7 +35,44 @@ export function buildDeliveryPlan(targets, statusRecipients, job, repeat) {
   return deliveries
 }
 
-export function sendDelivery(socket, delivery, content, options) {
+export class AutomationDeliveryError extends Error {}
+
+/** Resolve scheduled hidden mentions before recording a send attempt. */
+export async function prepareDeliveryContent(socket, delivery, content) {
+  const field = typeof content.text === 'string' ? 'text' : typeof content.caption === 'string' ? 'caption' : null
+  if (!field || !/(^|\s)\.tag(?=\s|$)/i.test(content[field])) return content
+  const cleaned = content[field].replace(/(?<!\S)\.tag(?=\s|$)[ \t]*/gi, '').trim()
+  const prepared = { ...content, [field]: cleaned }
+  const hasMedia = ['image', 'video', 'audio', 'document', 'sticker'].some(key => content[key] != null)
+  if (!cleaned && !hasMedia) throw new AutomationDeliveryError('Add message text or media alongside .tag before sending this automation.')
+  // The same saved message can also go to contacts or Status; never mention
+  // group members there or publish the automation directive itself.
+  if (delivery.kind !== 'message' || !delivery.jid.endsWith('@g.us')) return prepared
+  let metadata, timer
+  try {
+    metadata = await Promise.race([
+      Promise.resolve().then(() => socket.groupMetadata(delivery.jid)),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('metadata_timeout')), 15000) })
+    ])
+  } catch {
+    throw new AutomationDeliveryError('Could not load group members for .tag. Check the WhatsApp connection and group access before starting a new run.')
+  } finally { clearTimeout(timer) }
+  if (metadata?.id !== delivery.jid || !Array.isArray(metadata.participants) || !metadata.participants.length || metadata.participants.length > 5000) {
+    throw new AutomationDeliveryError('Could not verify group members for .tag. Refresh your groups before starting a new run.')
+  }
+  const userJid = value => typeof value === 'string' && /^\d{5,20}(?::\d{1,5})?@(s\.whatsapp\.net|lid)$/.test(value) ? value.replace(/:\d+@/, '@') : ''
+  const identities = new Map()
+  for (const member of metadata.participants) {
+    const jid = userJid(member?.id), canonical = userJid(member?.phoneNumber) || jid
+    if (jid && canonical && !identities.has(canonical)) identities.set(canonical, jid)
+  }
+  if (!identities.size) throw new AutomationDeliveryError('No valid group members are available for .tag. Refresh your groups before starting a new run.')
+  prepared.mentions = [...new Set(identities.values())]
+  return prepared
+}
+
+export async function sendDelivery(socket, delivery, content, options) {
+  content = await prepareDeliveryContent(socket, delivery, content)
   if (delivery.kind === 'status') {
     const textStyle = typeof content.text === 'string' ? { backgroundColor: '#008069', font: 1 } : {}
     return socket.sendMessage(delivery.jid, content, { ...textStyle, ...options, statusJidList: delivery.statusJidList })

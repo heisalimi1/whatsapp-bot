@@ -2,7 +2,15 @@
 
 In Automations, choose a saved message, select Groups, WhatsApp Status, Contacts, or a combination, then choose **Repeat at intervals**. Enter a whole number and select minutes, hours, or days. Text, uploaded images, and uploaded videos use the existing message/media controls. Status viewers come from the connected account's synced contacts; no manual viewer numbers are required. WhatsApp privacy rules still determine visibility.
 
+In Messages, select a JPG, PNG, WebP, MP4 or MOV file (up to 16 MB). It uploads automatically and shows an attachment preview. Save waits for any upload in progress; a failed upload keeps the draft and shows a Retry upload control. Save the message before choosing it in Automations, where the image or video also appears in the campaign preview. Edit restores the saved attachment; Remove attachment removes it from the draft without deleting the server file. Attachment previews require dashboard authentication and access to the selected account. Changing accounts clears the editor and discards late upload results from the previous account.
+
 Text-only Status posts use an opaque green/teal background (`#008069`) and WhatsApp's system text font. These style options apply only to text Status, preserving ordinary messages and image/video content.
+
+## Tagging group members
+
+Include `.tag` as a separate word in a saved message or media caption, for example `.tag Our meeting starts at 10 AM`. Automations remove the directive and send the remaining text or attachment with hidden mentions of the current group members. Each group receives one message per planned delivery, including on recurring schedules. The group members are fetched again for each delivery; normal sending intervals and restart protection still apply.
+
+If the same automation also sends to contacts or Status, those destinations receive the message without `.tag` or group mentions. A message containing only `.tag` needs text or an attachment. If group membership cannot be verified, that group delivery fails with an explanation instead of sending an untagged message. Refreshing or resuming does not automatically replay failed or unconfirmed deliveries. Saved messages remain unchanged. Automation messages are not deleted; automatic command cleanup applies only to a `.tag` command written in WhatsApp.
 
 Status eligibility uses the PN/LID pairs in the authenticated contact snapshot before consulting Baileys' mapping cache. Missing mappings are resolved in bounded batches. An unrelated unmapped blocked/excluded identifier does not stop all eligible viewers: contacts whose eligibility cannot be verified are withheld individually. Custom allow lists stay restrictive and blocked/excluded contacts remain excluded across aliases. The Sync WhatsApp contacts button verifies the audience and reports eligible viewers; the authenticated preview endpoint returns counts only, never contact identifiers. Previewing does not publish a Status.
 

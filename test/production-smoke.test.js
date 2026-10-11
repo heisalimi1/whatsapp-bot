@@ -347,7 +347,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert(browserElement('messageCards').innerHTML.includes('<h3>testing</h3>'), 'the message remains in the list after refreshing')
   assert(browserElement('jobMessage').innerHTML.includes('value="' + testingMessage.id + '">testing</option>'), 'the refreshed Automations dropdown retains the saved message')
   assert.match(dashboardMarkup, /messageSelect\.innerHTML=\(S\.cfg\.messages\|\|\[\]\)\.map/, 'Automations renders saved account messages as selectable options')
-  assert(dashboardMarkup.includes("var target='/api/accounts/'+encodeURIComponent(accountId)+'/messages'"), 'Save Message uses the account-scoped message API')
+  assert(dashboardMarkup.includes("var target='/api/accounts/'+encodeURIComponent(targetAccount)+'/messages'"), 'Save Message captures the account before awaiting an attachment upload')
 
   // Exercise the served creation handler against real authenticated HTTP routes.
   const missingAudience = await fetch(base + '/api/accounts/' + accountIds[0] + '/jobs', {
@@ -460,13 +460,22 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
     body: JSON.stringify({ accountId: accountIds[0], name: 'message-test.png', data: 'iVBORw0KGgo=' })
   })
   assert.equal(mediaUpload.status, 200, 'the existing account media upload route still works')
-  const mediaPath = (await mediaUpload.json()).path
+  const uploaded = await mediaUpload.json(), mediaPath = uploaded.path
+  assert.equal(uploaded.type, 'image')
+  assert.equal((await fetch(base + uploaded.previewUrl)).status, 401, 'attachment previews require authentication')
+  const privatePreview = await fetch(base + uploaded.previewUrl, { headers: proxyHeaders })
+  assert.equal(privatePreview.status, 200)
+  assert.match(privatePreview.headers.get('content-type'), /image\/png/)
+  assert.match(privatePreview.headers.get('cache-control'), /private.*no-store/)
+  assert.equal((await fetch(base + uploaded.previewUrl.replace(accountIds[0], accountIds[1]), { headers: proxyHeaders })).status, 404, 'an account cannot preview another account attachment')
   const mediaMessageResponse = await fetch(base + '/api/accounts/' + accountIds[0] + '/messages', {
     method: 'POST', headers: messageHeaders,
     body: JSON.stringify({ name: 'Uploaded media message', texts: [], media: mediaPath })
   })
   assert.equal(mediaMessageResponse.status, 201, 'a message can still save uploaded media')
   const mediaMessage = (await mediaMessageResponse.json()).savedMessage
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[0]}/messages/${mediaMessage.id}/media`, { headers: proxyHeaders })).status, 200, 'saved attachment preview works after persistence')
+  assert.equal((await fetch(`${base}/api/accounts/${accountIds[1]}/messages/${mediaMessage.id}/media`, { headers: proxyHeaders })).status, 404, 'saved preview enforces message ownership')
   const videoUpload = await fetch(base + '/api/upload', { method: 'POST', headers: messageHeaders,
     body: JSON.stringify({ accountId: accountIds[0], name: 'fixture.mp4', data: Buffer.from([0,0,0,16,102,116,121,112,109,112,52,50,0,0,0,0]).toString('base64') }) })
   assert.equal(videoUpload.status, 200, 'video uploads remain available')

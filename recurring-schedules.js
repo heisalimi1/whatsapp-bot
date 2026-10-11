@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import cron from 'node-cron'
-import { sendDelivery } from './automation-delivery.js'
+import { sendDelivery, prepareDeliveryContent, AutomationDeliveryError } from './automation-delivery.js'
 
 const units = { minutes: 60000, hours: 3600000, days: 86400000 }
 export const recurring = job => !!(job.interval || job.cron)
@@ -56,7 +56,9 @@ export async function dispatchDeliveryRun({ run, socket, contentFor, save, shoul
     if (entry.state !== 'pending') continue
     if (nextDelay && Date.parse(run.nextDeliveryAt || '') > now()) return { stopped: false, deferredUntil: run.nextDeliveryAt }
     let content
-    try { content = contentFor(entry) } catch { entry.state = 'failed'; onProgress(); await save(); continue }
+    try { content = await prepareDeliveryContent(socket, entry.delivery, await contentFor(entry)) }
+    catch (error) { entry.state = 'failed'; entry.error = error instanceof AutomationDeliveryError ? error.message : 'Could not prepare this message.'; onProgress(); await save(); continue }
+    if (shouldStop()) return { stopped: true }
     entry.state = 'attempting'
     if (nextDelay) run.nextDeliveryAt = ''
     await save()

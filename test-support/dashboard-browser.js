@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import sharp from 'sharp'
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
 async function waitFor(check, message) {
@@ -62,6 +63,12 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
       if (result.exceptionDetails) throw new Error('Browser evaluation failed: ' + (result.exceptionDetails.exception?.description || result.exceptionDetails.text).split('\n')[0])
       return result.result.value
     }
+    const captureState = async name => {
+      if (!screenshotDir) return
+      fs.mkdirSync(screenshotDir, { recursive: true })
+      const { data } = await command('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+      fs.writeFileSync(path.join(screenshotDir, name), Buffer.from(data, 'base64'))
+    }
     await command('Runtime.enable')
     await command('Network.enable')
     await command('Page.enable')
@@ -73,7 +80,7 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
     for (const route of ['/login', '/signup', '/forgot-password', '/reset-password']) {
       await command('Page.navigate', { url: base + route })
       await waitFor(() => evaluate('location.pathname===' + JSON.stringify(route) + '&&!!document.getElementById("form")'), 'The authentication page did not load: ' + route)
-      for (const width of [320, 360, 390, 768, 1365]) {
+      for (const width of [280, 320, 360, 390, 600, 768, 1024, 1365, 1920]) {
         await command('Emulation.setDeviceMetricsOverride', { width, height: 700, deviceScaleFactor: 1, mobile: width < 600 })
         await checkPageWidth(route + ' at ' + width + 'px', 'document.getElementById("message").textContent=""')
         await checkPageWidth(route + ' with a long response at ' + width + 'px', 'document.getElementById("message").textContent="LayoutTest".repeat(40)')
@@ -186,6 +193,69 @@ export async function checkDashboardBrowser({ base, cookie, secondCookie = cooki
       await checkPageWidth('populated Bot Commands at ' + width + 'px')
     }
     assert.deepEqual(layoutProblems, [], 'the populated command page fits desktop, tablet and mobile')
+    // Exercise actual file selection, automatic upload, image save and media previews.
+    const imageFile = path.join(profile, 'dashboard-fixture.png')
+    await sharp({ create: { width: 320, height: 180, channels: 3, background: '#087f6e' } }).png().toFile(imageFile)
+    const chooseImage = async () => {
+      const { root } = await command('DOM.getDocument')
+      const { nodeId } = await command('DOM.querySelector', { nodeId: root.nodeId, selector: '#messageFile' })
+      await command('DOM.setFileInputFiles', { nodeId, files: [imageFile] })
+    }
+    await command('Emulation.setDeviceMetricsOverride', { width: 320, height: 700, deviceScaleFactor: 1, mobile: true })
+    await evaluate('showView("messages");newMessage();document.getElementById("messageName").value="Browser image message";document.getElementById("messageText").value=".tag Image caption";window.mediaTestFetch=window.fetch;window.mediaTestUploads=0;window.mediaTestSaves=0;window.fetch=function(url,options){if(url==="/api/upload"){window.mediaTestUploads++;return new Promise(resolve=>{window.finishMediaTestUpload=()=>resolve(window.mediaTestFetch(url,options))})}if(url.endsWith("/messages")&&options?.method==="POST")window.mediaTestSaves++;return window.mediaTestFetch(url,options)}')
+    await chooseImage()
+    await waitFor(() => evaluate('!!window.finishMediaTestUpload'), 'Selecting an image did not start an upload.')
+    await checkPageWidth('320px image upload pending')
+    await evaluate('document.querySelector("#messages > .card > .actions button").click();document.querySelector("#messages > .card > .actions button").click()')
+    assert.equal(await evaluate('window.mediaTestSaves'), 0, 'Save waits for the attachment instead of saving a text-only message')
+    assert.equal(await evaluate('messageSaving'), true)
+    await evaluate('window.finishMediaTestUpload()')
+    await waitFor(() => evaluate('S.cfg.messages.some(m=>m.name==="Browser image message")&&!messageSaving'), 'The image message did not finish saving.')
+    assert.equal(await evaluate('window.mediaTestUploads'), 1); assert.equal(await evaluate('window.mediaTestSaves'), 1, 'double clicking does not duplicate a save')
+    const imageMessageId = await evaluate('S.cfg.messages.find(m=>m.name==="Browser image message").id')
+    assert(await evaluate('!!S.cfg.messages.find(m=>m.name==="Browser image message").media'))
+    await evaluate('document.querySelector("#messageCards img[src*=\\"' + imageMessageId + '\\"]")?.scrollIntoView({block:"center"})')
+    await waitFor(() => evaluate('document.querySelector("#messageCards img[src*=\\"' + imageMessageId + '\\"]")?.naturalWidth===320'), 'The visible saved image thumbnail did not load.')
+    await evaluate('window.fetch=window.mediaTestFetch;previewMessage(' + JSON.stringify(imageMessageId) + ')')
+    await waitFor(() => evaluate('document.querySelector("#messagePreviewBody img")?.naturalWidth===320'), 'The image dialog did not load.')
+    await captureState('message-image-preview-320.png')
+    for (const width of [280, 320, 390, 600, 768, 1024, 1365, 1920]) {
+      await command('Emulation.setDeviceMetricsOverride', { width, height: 700, deviceScaleFactor: 1, mobile: width < 700 })
+      await checkPageWidth('image preview dialog at ' + width + 'px')
+      assert(await evaluate('(()=>{const r=document.getElementById("messagePreviewDialog").getBoundingClientRect();return r.left>=0&&r.right<=window.innerWidth&&r.height<=window.innerHeight})()'), 'the dialog fits the visible screen')
+    }
+    await evaluate('closeMessagePreview();showView("jobs");document.getElementById("jobMessage").value=' + JSON.stringify(imageMessageId) + ';updateJobSummary()')
+    await waitFor(() => evaluate('document.querySelector("#jobMediaPreview img")?.naturalWidth===320'), 'Automation did not preview the chosen saved image.')
+    await command('Page.reload', { ignoreCache: true })
+    await waitFor(() => evaluate('typeof S!=="undefined"&&S?.cfg?.messages.some(m=>m.id===' + JSON.stringify(imageMessageId) + ')'), 'The image message did not survive refresh.')
+    await evaluate('editMessage(' + JSON.stringify(imageMessageId) + ')')
+    await waitFor(() => evaluate('document.querySelector("#messageMediaPreview img")?.naturalWidth===320'), 'Editing did not restore the saved image.')
+    assert.equal(await evaluate('document.getElementById("messageText").value'), '.tag Image caption')
+    await command('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true })
+    await evaluate('document.getElementById("messageName").scrollIntoView({block:"start"})')
+    await captureState('message-image-editor-390.png')
+    await evaluate('removeMessageMedia()')
+    assert.equal(await evaluate('mediaPath'), ''); assert.equal(await evaluate('document.getElementById("messageFile").value'), '')
+    assert.equal(await evaluate('document.getElementById("messageMediaPreview").innerHTML'), '')
+    await evaluate('newMessage();showView("messages");window.mediaSwitchFetch=window.fetch;window.fetch=function(url,options){if(url==="/api/upload")return new Promise(resolve=>{window.finishMediaSwitch=()=>resolve(window.mediaSwitchFetch(url,options))});return window.mediaSwitchFetch(url,options)}')
+    await chooseImage()
+    await waitFor(() => evaluate('!!window.finishMediaSwitch'), 'The pending account-switch upload did not start.')
+    await evaluate('selectAccount(S.accounts.find(a=>a.id!==accountId).id)')
+    await evaluate('window.finishMediaSwitch();window.fetch=window.mediaSwitchFetch')
+    await pause(150)
+    assert.equal(await evaluate('mediaPath'), '', 'a late upload cannot attach another account media to the new draft')
+    await evaluate('selectAccount(' + JSON.stringify(accountId) + ')')
+    await waitFor(() => evaluate('S.selectedAccountId===' + JSON.stringify(accountId)), 'The original account did not reload.')
+    // Check populated and expanded states on every dashboard page, plus landscape.
+    for (const width of [280, 320, 360, 390, 600, 768, 820, 1024, 1365, 1920]) {
+      await command('Emulation.setDeviceMetricsOverride', { width, height: width === 820 ? 390 : 800, deviceScaleFactor: 1, mobile: width < 850 })
+      for (const view of ['overview', 'accounts', 'messages', 'groups', 'jobs', 'commands', 'settings']) {
+        await evaluate('showView(' + JSON.stringify(view) + ');document.querySelectorAll("#'+view+' details").forEach(d=>d.open=true)')
+        await checkPageWidth('expanded ' + view + ' at ' + width + 'px')
+        assert(await evaluate('[...document.querySelectorAll("#'+view+' input,#'+view+' select,#'+view+' textarea,#'+view+' button")].filter(el=>el.getClientRects().length&&!el.closest(".wrap")).every(el=>{const r=el.getBoundingClientRect();return r.left>=-1&&r.right<=window.innerWidth+1})'), 'interactive controls fit '+view+' at '+width+'px')
+      }
+    }
+    assert.deepEqual(layoutProblems, [], 'populated, expanded and upload states fit every tested screen')
     await command('Emulation.setDeviceMetricsOverride', { width: 1365, height: 1000, deviceScaleFactor: 1, mobile: false })
     await mobileEvaluate('showView("messages");document.getElementById("messageName").value="Unsaved mobile draft";document.getElementById("messageName").focus()')
     await evaluate('showView("groups");document.getElementById("newListName").value="Browser shared list";addList()')

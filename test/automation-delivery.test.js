@@ -3,13 +3,69 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { normalizeDestinations, buildDeliveryPlan, sendDelivery } from '../automation-delivery.js'
+import { normalizeDestinations, buildDeliveryPlan, sendDelivery, prepareDeliveryContent } from '../automation-delivery.js'
 import { StatusAudience } from '../status-audience.js'
 import { generateWAMessageContent } from '@whiskeysockets/baileys'
 
 const viewers = ['12345678901', '12345678902']
 const group = { jid: 'test-group@g.us', name: 'Test group' }
 const data = { groupLists: { Team: [group.jid], Empty: [] }, recipients: [{ id: 'contact' }], statusRecipients: viewers }
+
+test('automation .tag sends one hidden mention message using fresh group members and native Baileys encoding', async () => {
+  const jid = '1234567890@g.us', calls = [], lookups = []
+  let members = [{ id: '12345678901:2@s.whatsapp.net' }, { id: '123456789012345@lid', phoneNumber: '12345678902@s.whatsapp.net' }, { id: '12345678902@s.whatsapp.net' }]
+  const socket = {
+    async groupMetadata(id) { lookups.push(id); return { id, participants: members } },
+    async sendMessage(...args) { calls.push(args); return generateWAMessageContent(args[1], args[2] || {}) }
+  }
+  const input = { text: '.tag Meeting today\nPlease join us.' }, options = { messageId: 'FIXTURE-TAG-ID' }
+  const encoded = await sendDelivery(socket, { kind: 'message', jid }, input, options)
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0], [jid, { text: 'Meeting today\nPlease join us.', mentions: ['12345678901@s.whatsapp.net', '123456789012345@lid'] }, options])
+  assert.deepEqual(encoded.extendedTextMessage.contextInfo.mentionedJid, calls[0][1].mentions)
+  assert.equal(encoded.extendedTextMessage.text, 'Meeting today\nPlease join us.')
+  assert.deepEqual(input, { text: '.tag Meeting today\nPlease join us.' }, 'saved message is never mutated')
+  members = [{ id: '12345678903@s.whatsapp.net' }]
+  await sendDelivery(socket, { kind: 'message', jid }, input, options)
+  assert.deepEqual(calls[1][1].mentions, ['12345678903@s.whatsapp.net'])
+  assert.deepEqual(lookups, [jid, jid], 'each run verifies current members')
+})
+
+test('automation tags work in text and media captions without leaking group mentions to contacts or Status', async () => {
+  const calls = [], socket = {
+    async groupMetadata(id) { return { id, participants: [{ id: '12345678901@s.whatsapp.net' }] } },
+    async sendMessage(...args) { calls.push(args) }
+  }
+  for (const content of [{ text: 'Hello .tag everyone' }, { image: Buffer.from('fixture'), caption: '.tag New image' }, { video: Buffer.from('fixture'), caption: 'New video\n.tag' }, { image: Buffer.from('fixture'), caption: '.tag' }]) {
+    for (const delivery of [{ kind: 'message', jid: '1234567890@g.us' }, { kind: 'message', jid: '12345678902@s.whatsapp.net' }, { kind: 'status', jid: 'status@broadcast', statusJidList: ['12345678902@s.whatsapp.net'] }]) {
+      const before = structuredClone(content), options = { messageId: 'FIXTURE' }
+      await sendDelivery(socket, delivery, content, options)
+      const [, sent, sendOptions] = calls.at(-1)
+      assert(!/(^|\s)\.tag(?=\s|$)/i.test(sent.text || sent.caption || ''))
+      assert.equal(sent.image, content.image); assert.equal(sent.video, content.video)
+      assert.deepEqual(sent.mentions, delivery.jid.endsWith('@g.us') ? ['12345678901@s.whatsapp.net'] : undefined)
+      assert.equal(sendOptions.messageId, 'FIXTURE')
+      if (delivery.kind === 'status') assert.deepEqual(sendOptions.statusJidList, delivery.statusJidList)
+      assert.equal(content.text, before.text); assert.equal(content.caption, before.caption)
+    }
+  }
+  assert.equal(calls.length, 12, 'one outgoing message per planned delivery')
+  assert.equal((await prepareDeliveryContent(socket, { kind: 'message', jid: '1234567890@g.us' }, { text: '.TAG .tag Hello' })).text, 'Hello')
+  for (const text of ['.tagged Hello', 'https://example.test/.tag', 'email.tag@example.test', 'ordinary message']) {
+    const content = { text }
+    assert.equal(await prepareDeliveryContent({}, { kind: 'message', jid: '1234567890@g.us' }, content), content, 'ordinary content remains unchanged')
+  }
+})
+
+test('invalid empty tags and unavailable group metadata never send a message or leak error details', async () => {
+  let sends = 0
+  const base = { async sendMessage() { sends++ } }, delivery = { kind: 'message', jid: '1234567890@g.us' }
+  await assert.rejects(() => sendDelivery(base, delivery, { text: '.tag' }), /Add message text or media/)
+  for (const socket of [base, { ...base, async groupMetadata() { throw new Error('private-fixture-error') } }, { ...base, async groupMetadata() { return { id: 'other@g.us', participants: [] } } }, { ...base, async groupMetadata(id) { return { id, participants: [{ id: 'invalid' }] } } }]) {
+    await assert.rejects(() => sendDelivery(socket, delivery, { text: '.tag Hello' }), error => /group members/i.test(error.message) && !error.message.includes('private-fixture-error'))
+  }
+  assert.equal(sends, 0)
+})
 
 test('Groups, Status and contacts are independent destinations with validated audiences', () => {
   assert.deepEqual(normalizeDestinations(data, { toLists: ['Team'] }).value, { toLists: ['Team'], toRecipients: [], toStatus: false })

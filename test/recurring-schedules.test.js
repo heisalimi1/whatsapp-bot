@@ -2,6 +2,37 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { validSendingDelays, recoverInterruptedJob, parseSchedule, intervalMilliseconds, nextIntervalRun, createDeliveryRun, dispatchDeliveryRun, runMetrics } from '../recurring-schedules.js'
 
+test('scheduled tags preserve pacing, stable IDs, failed preparation and restart duplicate protection', async () => {
+  const deliveries = ['1234567890@g.us', '1234567891@g.us', '1234567892@g.us'].map(jid => ({ jid, kind: 'message' }))
+  let now = 1000, saved, stop = false
+  const calls = [], lookups = [], socket = {
+    async groupMetadata(id) { lookups.push(id); if (id === deliveries[1].jid) throw Error('fixture-private-metadata-error'); return { id, participants: [{ id: '12345678901@s.whatsapp.net' }] } },
+    async sendMessage(jid, body, options) { calls.push({ jid, body, options }); assert.equal(saved.entries.find(e => e.delivery.jid === jid).state, 'attempting') }
+  }
+  let run = createDeliveryRun('tag-fixture', deliveries, { texts: ['.tag Hello everyone'] })
+  const dispatch = () => dispatchDeliveryRun({ run, socket, contentFor: e => ({ text: e.text }), save() { saved = structuredClone(run) }, shouldStop: () => stop, nextDelay: () => 60000, now: () => now })
+  assert.equal((await dispatch()).deferredUntil, new Date(61000).toISOString())
+  assert.equal(calls.length, 1); assert.equal(lookups.length, 1)
+  run = structuredClone(saved); stop = true; await dispatch(); assert.equal(calls.length, 1)
+  stop = false; now = 61000; await dispatch()
+  assert.deepEqual(run.entries.map(e => e.state), ['sent', 'failed', 'sent'])
+  assert.match(run.entries[1].error, /Could not load group members/)
+  assert(!run.entries[1].error.includes('fixture-private'))
+  assert.deepEqual(calls.map(c => c.jid), [deliveries[0].jid, deliveries[2].jid])
+  assert(calls.every(c => c.body.text === 'Hello everyone' && c.body.mentions.length === 1))
+  assert(calls.every(c => c.options.messageId === run.entries.find(e => e.delivery.jid === c.jid).messageId))
+  assert.equal(lookups.length, 3, 'exactly one metadata lookup per attempted group, no command replay')
+  run = structuredClone(saved); await dispatch(); assert.equal(calls.length, 2, 'refresh and restart do not send again')
+  assert.deepEqual(runMetrics(run), { progress: 3, total: 3, failedCount: 1, uncertainCount: 0 })
+})
+
+test('pausing during group member lookup leaves the tagged delivery pending and unsent', async () => {
+  let paused = false, sends = 0
+  const run = createDeliveryRun('pause-tag', [{ kind: 'message', jid: '1234567890@g.us' }], { texts: ['.tag Hello'] })
+  const result = await dispatchDeliveryRun({ run, socket: { async groupMetadata(id) { paused = true; return { id, participants: [{ id: '12345678901@s.whatsapp.net' }] } }, async sendMessage() { sends++ } }, contentFor: e => ({ text: e.text }), save() {}, shouldStop: () => paused })
+  assert.equal(result.stopped, true); assert.equal(sends, 0); assert.equal(run.entries[0].state, 'pending')
+})
+
 test('restart recovery resumes recurring work and preserves explicitly paused schedules', () => {
   for (const cadence of [{ interval: { value: 2, unit: 'hours' } }, { cron: '* * * * *' }]) {
     const job = { ...cadence, status: 'running', progress: 3, activeRun: { entries: [{ state: 'attempting' }] } }

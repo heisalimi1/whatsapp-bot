@@ -8,7 +8,7 @@
   earlier 79-test workspace suite also passed on Node 24.21.0; the additional
   test verifies deadline cancellation during SQLite backup on Node 22.23.3.
 - **23 commands** are included: 12 group, 3 media, 4 utilities, 4 basic.
-- The explicit 35-file release review passes. No private runtime files are
+- The explicit file list in `deploy/production-release-files.json` passes review. No private runtime files are
   selected or staged. Main matches GitHub main at the existing commit; no push
   or commit has been performed. The source-only candidate was assembled outside
   the repository for validation, without copying customer data or `.env`.
