@@ -24,7 +24,9 @@ function fixture(t) {
   const makeSocket = () => ({ user: { id: owner }, async groupMetadata() { return structuredClone(groups) },
     async sendMessage(jid, content, options) { calls.push({ jid, content, options }); return { key: { id: options?.messageId } } },
     async groupParticipantsUpdate(jid, members, action) { calls.push({ action, members, jid }); return [{ status: '200' }] },
-    async groupSettingUpdate(jid, setting) { calls.push({ setting, jid }) }
+    async groupSettingUpdate(jid, setting) { calls.push({ setting, jid }) },
+    async groupLeave(jid) { calls.push({ leave: jid }) },
+    async updateBlockStatus(jid, action) { calls.push({ block: jid, action }) }
   })
   socket = makeSocket()
   const services = { async schedule(context, args) { scheduled.push({ id: context.account.id, args }); return 'Schedule created.' }, async broadcast(context, args) { broadcasted.push({ id: context.account.id, args }); return 'Broadcast queued.' }, async isAutomationMessage(_, id) { return id === 'automation-echo' } }
@@ -46,6 +48,101 @@ function fixture(t) {
   }
 }
 const ownerKey = { fromMe: true, participant: owner }
+
+test('leave exits the current group once without needing administrator privileges', async t => {
+  const f = fixture(t); f.groups.participants.find(m => m.id === owner).admin = null
+  const message = f.message('.leave', { key: ownerKey })
+  await Promise.all([f.deliver(message), f.deliver(message)])
+  await f.restart(); f.advance(); await f.deliver(message)
+  assert.deepEqual(f.calls.filter(c => c.leave), [{ leave: group }])
+  assert(f.calls.some(c => c.jid === owner && c.content?.text === 'Left the WhatsApp group.'))
+  assert.equal(f.calls.filter(c => c.jid === group).length, 0, 'no post is attempted in a group after leaving')
+})
+
+test('leave rejects private chats, arguments and unverified membership', async t => {
+  const f = fixture(t)
+  await f.send('.leave', { key: { ...ownerKey, remoteJid: member } })
+  f.advance(); await f.send('.leave another-group', { key: ownerKey })
+  f.groups.participants = f.groups.participants.filter(p => p.id !== owner)
+  f.advance(); await f.send('.leave', { key: ownerKey })
+  assert.equal(f.calls.filter(c => c.leave).length, 0)
+  assert(f.calls.some(c => c.content?.text?.includes('groups only')))
+  assert(f.calls.some(c => c.content?.text?.includes('Usage:')))
+})
+
+test('block resolves a private chat, a quoted group sender, one mention and an explicit number', async t => {
+  const f = fixture(t)
+  const cases = [
+    ['.block', { key: { ...ownerKey, remoteJid: member } }, member],
+    ['.block', { key: ownerKey, message: { extendedTextMessage: { text: '.block', contextInfo: { participant: administrator, quotedMessage: { conversation: 'Fixture' } } } } }, administrator],
+    ['.block', { key: ownerKey, message: { extendedTextMessage: { text: '.block', contextInfo: { mentionedJid: [founder] } } } }, founder],
+    ['.block +15105550109', { key: ownerKey }, '15105550109@s.whatsapp.net']
+  ]
+  for (const [text, options, target] of cases) {
+    f.advance(); await f.send(text, options)
+    assert.equal(f.calls.filter(c => c.block).at(-1).block, target)
+  }
+  assert.equal(f.calls.filter(c => c.block).length, 4)
+  assert(f.calls.filter(c => c.content?.text === 'User blocked for this WhatsApp account.').every(c => c.jid === owner), 'confirmations are private to the connected account')
+})
+
+test('block rejects ambiguous targets, self aliases, statuses and groups', async t => {
+  const f = fixture(t), lid = '123456789012345@lid'
+  f.socket.user.lid = lid
+  for (const [text, options] of [
+    ['.block', { key: ownerKey }], ['.block ' + group, { key: ownerKey }], ['.block status@broadcast', { key: ownerKey }],
+    ['.block ' + owner, { key: ownerKey }], ['.block ' + lid, { key: ownerKey }], ['.block +15105550102 +15105550103', { key: ownerKey }],
+    ['.block', { key: ownerKey, message: { extendedTextMessage: { text: '.block', contextInfo: { mentionedJid: [member, administrator] } } } }],
+    ['.block', { key: ownerKey, message: { extendedTextMessage: { text: '.block', contextInfo: { participant: member, remoteJid: 'status@broadcast', quotedMessage: { conversation: 'Fixture' } } } } }]
+  ]) { f.advance(); await f.send(text, options) }
+  assert.equal(f.calls.filter(c => c.block).length, 0)
+})
+
+test('block resolves LID targets through the current group metadata without targeting self', async t => {
+  const f = fixture(t), lid = '123456789012345@lid'
+  f.groups.participants.find(m => m.id === member).id = lid
+  f.groups.participants.find(m => m.id === lid).phoneNumber = member
+  await f.send('.block', { key: ownerKey, message: { extendedTextMessage: { text: '.block', contextInfo: { mentionedJid: [lid] } } } })
+  assert.deepEqual(f.calls.filter(c => c.block), [{ block: member, action: 'block' }])
+})
+
+test('unconfirmed leave and block actions are not repeated after replay or restart', async t => {
+  const f = fixture(t)
+  for (const [name, method, marker] of [['leave', 'groupLeave', 'leave'], ['block', 'updateBlockStatus', 'block']]) {
+    const original = f.socket[method].bind(f.socket)
+    t.mock.method(f.socket, method, async (...args) => { await original(...args); throw Error('private-fixture-details') })
+    const msg = f.message('.' + name, { key: { ...ownerKey, remoteJid: name === 'block' ? member : group } })
+    f.advance(); await f.deliver(msg); await f.restart(); f.advance(); await f.deliver(msg)
+    assert.equal(f.calls.filter(c => c[marker]).length, 1)
+    assert(f.calls.every(c => !c.content?.text?.includes('private-fixture-details')))
+  }
+})
+
+test('failed private confirmations do not repeat successful leave or block actions', async t => {
+  const f = fixture(t)
+  t.mock.method(f.socket, 'sendMessage', async () => { throw Error('fixture-confirmation-failed') })
+  await f.send('.leave', { key: ownerKey }); f.advance()
+  await f.send('.block ' + member, { key: ownerKey })
+  assert.equal(f.calls.filter(c => c.leave).length, 1); assert.equal(f.calls.filter(c => c.block).length, 1)
+  assert(f.store.statistics(workspace, accountId).every(s => s.failures === 0))
+})
+
+test('existing accounts gain owner-only leave/block without rewriting their saved settings', t => {
+  const f = fixture(t), legacy = accountDefaults()
+  delete legacy.commands.leave; delete legacy.commands.block
+  const connection = new DatabaseSync(f.database), serialized = JSON.stringify(legacy)
+  try {
+    connection.prepare('INSERT INTO bot_command_settings VALUES(?,?,?,?)').run(workspace, accountId, 8, serialized)
+    const current = f.store.settings(workspace, accountId)
+    assert.deepEqual(current.config.commands.leave, { enabled: true, permission: 'owner' })
+    assert.deepEqual(current.config.commands.block, { enabled: true, permission: 'owner' })
+    assert.equal(current.revision, 8)
+    assert.equal(connection.prepare('SELECT config FROM bot_command_settings').get().config, serialized)
+    f.configure(c => { c.commands.leave.enabled = false; c.commands.block.enabled = false })
+    assert.equal(f.store.settings(workspace, accountId).config.commands.leave.enabled, false)
+    assert.equal(f.store.settings(workspace, accountId).config.commands.block.enabled, false)
+  } finally { connection.close() }
+})
 
 async function waitUntil(predicate) {
   const deadline = Date.now() + 1500
@@ -111,12 +208,12 @@ test('buffered tag cleanup cannot delay a new command in the same incoming batch
   } finally { gate.resolve(); await work }
   assert.equal(f.calls.filter(call => call.content?.delete).length, 1)
 })
-test('catalog has 19 disabled feature commands and four safe owner defaults', t => {
+test('catalog has 19 opt-in tools, four basic commands and enabled owner-only leave/block', t => {
   const f = fixture(t), settings = f.store.settings(workspace, accountId)
-  assert.equal(COMMANDS.length, 23)
-  assert.equal(COMMANDS.filter(c => c.category !== 'Basic').length, 19)
+  assert.equal(COMMANDS.length, 25)
+  assert.equal(COMMANDS.filter(c => c.category !== 'Basic').length, 21)
   assert.equal(COMMANDS.filter(c => c.category === 'Basic').length, 4)
-  assert(COMMANDS.filter(c => c.category !== 'Basic').every(c => !settings.config.commands[c.name].enabled))
+  assert(COMMANDS.filter(c => c.category !== 'Basic' && !['leave', 'block'].includes(c.name)).every(c => !settings.config.commands[c.name].enabled))
   assert(COMMANDS.filter(c => c.category === 'Basic').every(c => settings.config.commands[c.name].enabled && settings.config.commands[c.name].permission === 'owner'))
   assert.equal(settings.config.prefix, '.')
 })
@@ -503,7 +600,7 @@ test('tag never retries an unconfirmed send when the event is replayed', async t
 
 test('tag replaces the old command in catalog, menus, help and execution', async t => {
   const f = fixture(t); f.enable('tag')
-  assert.equal(COMMANDS.length, 23)
+  assert.equal(COMMANDS.length, 25)
   assert(COMMANDS.some(c => c.name === 'tag')); assert(!COMMANDS.some(c => c.name === 'hidetag'))
   await f.send('.menu', { key: ownerKey })
   assert.match(f.calls.at(-1).content.text, /\.tag /); assert.doesNotMatch(f.calls.at(-1).content.text, /hidetag/)
@@ -528,7 +625,7 @@ test('existing hidden-tag settings and statistics project to tag without modifyi
     assert.equal(current.revision, 4); assert.equal(current.config.prefix, '!')
     assert.deepEqual(current.config.commands.tag, { ...legacy.commands.hidetag, permission: 'owner' })
     assert.equal(current.config.commands.hidetag, undefined)
-    assert.equal(Object.keys(current.config.commands).length, 23)
+    assert.equal(Object.keys(current.config.commands).length, 25)
     assert.equal(f.store.settings(otherWorkspace, accountId).config.commands.tag.enabled, false)
     assert.deepEqual(f.store.statistics(workspace, accountId), [{ command: 'tag', successes: 2, failures: 1 }])
     assert.equal(connection.prepare('SELECT config FROM bot_command_settings').get().config, JSON.stringify(legacy))
@@ -646,10 +743,10 @@ test('retired commands disappear from stored settings, statistics, menus, help a
     for (const name of retired) f.store.statistic(workspace, accountId, name, true)
     const current = f.store.settings(workspace, accountId)
     assert.equal(current.revision, 1); assert.equal(current.config.cooldownSeconds, 17); assert.equal(current.config.prefix, '!')
-    assert.equal(Object.keys(current.config.commands).length, 23)
+    assert.equal(Object.keys(current.config.commands).length, 25)
     assert.deepEqual(current.config.commands.ping, legacy.commands.ping)
     assert.deepEqual(f.store.statistics(workspace, accountId), [])
-    assert.equal(Object.keys(JSON.parse(connection.prepare('SELECT config FROM bot_command_settings').get().config).commands).length, 29, 'reading settings does not alter old database data')
+    assert.equal(Object.keys(JSON.parse(connection.prepare('SELECT config FROM bot_command_settings').get().config).commands).length, Object.keys(legacy.commands).length, 'reading settings does not alter old database data')
     for (const name of retired) {
       const before = f.calls.length
       await f.send('!' + name, { key: ownerKey }); assert.equal(f.calls.length, before)
@@ -659,7 +756,7 @@ test('retired commands disappear from stored settings, statistics, menus, help a
     f.advance(18000); await f.send('!menu', { key: ownerKey })
     assert(retired.every(name => !f.calls.at(-1).content.text.includes(name)))
     f.store.saveSettings(workspace, accountId, current.config, current.revision)
-    assert.equal(Object.keys(JSON.parse(connection.prepare('SELECT config FROM bot_command_settings').get().config).commands).length, 23)
+    assert.equal(Object.keys(JSON.parse(connection.prepare('SELECT config FROM bot_command_settings').get().config).commands).length, 25)
   } finally { connection.close() }
 })
 test('phrase matching uses literal Unicode words instead of substrings or executable patterns', () => {

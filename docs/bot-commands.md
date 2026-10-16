@@ -31,15 +31,16 @@ process environment. This extension does not relocate any existing database.
 
 ## Implemented commands
 
-There are **23 supported commands**.
-All 19 feature commands start disabled. The four basic commands start enabled
-for the connected WhatsApp account owner only.
+There are **25 supported commands**.
+The existing 19 feature commands start disabled. The four basic commands and the
+requested `.leave` and `.block` commands start enabled for the connected account
+owner only. Existing saved switches remain unchanged.
 
 | Category | Supported |
 | --- | --- |
-| Group administration (12) | `tagall`, `tag`, `kick`, `promote`, `demote`, `mute`, `unmute`, `antilink`, `antiword`, `antispam`, `welcome`, `warn` |
+| Group administration (13) | `tagall`, `tag`, `kick`, `promote`, `demote`, `mute`, `unmute`, `antilink`, `antiword`, `antispam`, `welcome`, `warn`, `leave` |
 | Media (3) | `sticker` (image/short video), `toimg` (sticker to PNG), `tomp3` (video audio to MP3) |
-| Utilities (4) | `autoreply`, `schedule`, `broadcast`, `statussave` |
+| Utilities (5) | `autoreply`, `schedule`, `broadcast`, `statussave`, `block` |
 | Basic (4) | `menu`, `help`, `ping`, `alive` |
 
 ## Dashboard and usage
@@ -356,3 +357,11 @@ directories as a rollback procedure.
 - [Sharp output/conversion API](https://sharp.pixelplumbing.com/api-output/)
 - [FFmpeg protocol restrictions](https://ffmpeg.org/ffmpeg-protocols.html)
 - [ffmpeg-static installation and binary licensing](https://github.com/eugeneware/ffmpeg-static)
+
+## Leaving groups and blocking users
+
+Only the connected WhatsApp account can invoke these commands from its own phone or linked devices. Other people's commands remain silent. `.leave` exits the current group without requiring administrator rights. It takes no arguments and cannot leave another group from a private chat.
+
+Use `.block` while replying to a user, with one mention, with a full number including country code, or without arguments in that person's private chat. It blocks that user for the connected account; it does not remove them from a group. The connected account cannot block itself. Ambiguous targets, cross-chat quotes and unresolved identifiers are rejected. Success confirmations go to the account's private self chat, not to the blocked person or the group.
+
+Both commands are included in the dashboard, menu and help. Existing saved settings are projected without rewriting customer records; either command can be disabled in Bot Commands. Duplicate events, reconnect replay and failed confirmations never repeat the action automatically. An unconfirmed WhatsApp response is not retried; verify membership or the block list before issuing a new command.

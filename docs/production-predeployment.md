@@ -1,13 +1,20 @@
 # Production pre-deployment review
 
-## Current check result — 2026-10-09
+## Command update — 2026-10-16
+
+The current catalog contains 25 commands: 13 group commands, three media tools,
+five utilities and four basic commands. Owner-only `.leave` and `.block` are
+included in the dashboard, menus, help and isolated tests. No database migration
+or dependency change is required for this update.
+
+## Historical check result — 2026-10-09
 
 - **80/80 automated tests passed** on Node 22.23.3 in the exact source-only
   release candidate, excluding the unrelated authentication edit. This includes
   real Chromium desktop/mobile checks and **17 backup/release tests**. The
   earlier 79-test workspace suite also passed on Node 24.21.0; the additional
   test verifies deadline cancellation during SQLite backup on Node 22.23.3.
-- **23 commands** are included: 12 group, 3 media, 4 utilities, 4 basic.
+- **23 commands** were included: 12 group, 3 media, 4 utilities, 4 basic.
 - The explicit file list in `deploy/production-release-files.json` passes review. No private runtime files are
   selected or staged. Main matches GitHub main at the existing commit; no push
   or commit has been performed. The source-only candidate was assembled outside
@@ -43,7 +50,7 @@ pre-deployment phase.
 `deploy/production-release-files.json` is the explicit list of source, tests,
 templates and documentation intended for release. `scripts/production-preflight.js`
 checks that list, rejects private runtime paths and high-confidence secret
-patterns, validates 23 commands and checks staged files. It does not stage,
+patterns, validates 25 commands and checks staged files. It does not stage,
 commit, push or deploy. Pattern scanning is a review aid, not a guarantee against
 every possible secret format. Never use an indiscriminate `git add .`.
 

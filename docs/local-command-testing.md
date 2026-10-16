@@ -27,12 +27,11 @@ existing server. The launcher prints the exact localhost URL.
    command test**, and save it. Refresh to check persistence.
 7. Open **Bot Commands**, enable the tools you want to test, and **Save account
    settings**. Then select the test group, configure its rules and **Save group
-   settings**. The default prefix is `.`; all 19 feature commands start disabled.
+   settings**. The default prefix is `.`; the existing 19 feature commands start disabled; `.leave` and `.block` are enabled for the account owner.
 
 Send all commands from the connected spare account's phone or its linked
 devices. A dashboard login does not make a different phone the WhatsApp command
-owner. Basic commands can be tried in the spare account's own chat. Group actions
-need verified administrator permissions even when sent by the account owner.
+owner. Basic commands can be tried in the spare account's own chat. Group moderation actions need verified administrator permissions. Leaving a group and blocking a user do not require administrator rights.
 Send `.menu`, `.tag Test announcement` and other commands from a different
 test-group member or a private chat: there should be no reply or command action,
 even when that member is an administrator. Commands cannot be delegated.
@@ -43,7 +42,7 @@ should not wait for that action. Actions that change the same group remain order
 Actual phone delivery still depends on WhatsApp connectivity; the private server
 log records a safe timing summary when sending or processing takes over one second.
 
-## Checklist for all 23 commands
+## Checklist for all 25 commands
 
 | Commands | Test and expected result |
 | --- | --- |
@@ -121,3 +120,10 @@ the dashboard or as safe command replies. Private server logs stay in the
 sandbox's `application.log`; do not paste passwords, pairing codes, credentials or
 contact data into chat. Tests run automatically with `npm test` using additional
 temporary isolated fixtures and mocked WhatsApp sockets.
+
+## Leaving and blocking with spare accounts
+
+| Command | Test and expected result |
+| --- | --- |
+| `.leave` | From the spare account only, send it in a disposable test group. The account leaves once and receives a self-chat confirmation. Do not test against customer groups. |
+| `.block` | Use a consenting spare contact: reply, mention or send a full number; bare `.block` uses the current private contact. Confirm the account block list. Other people cannot trigger it. |

@@ -211,7 +211,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   const commandUrl = base + '/api/accounts/' + accountIds[0] + '/commands'
   assert.equal((await fetch(commandUrl)).status, 401, 'command settings require dashboard authentication')
   const initialCommands = await (await fetch(commandUrl, { headers: messageHeaders })).json()
-  assert.equal(initialCommands.catalog.length, 23)
+  assert.equal(initialCommands.catalog.length, 25)
   assert(initialCommands.catalog.some(c => c.name === 'tag' && c.usage === 'tag [message] (or reply to a message)'))
   assert(!initialCommands.catalog.some(c => c.name === 'hidetag'))
   assert.equal(initialCommands.config.commands.tag.enabled, false)
@@ -220,7 +220,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   assert(Object.values(initialCommands.config.commands).every(c => c.permission === 'owner'))
   const delegatedCommands = structuredClone(initialCommands.config); delegatedCommands.commands.tag.permission = 'admin'
   assert.equal((await fetch(commandUrl, { method: 'PUT', headers: messageHeaders, body: JSON.stringify({ config: delegatedCommands, revision: initialCommands.revision }) })).status, 400, 'no command can be delegated to other WhatsApp users')
-  assert(initialCommands.catalog.filter(c => c.category !== 'Basic').every(c => !initialCommands.config.commands[c.name].enabled))
+  assert(initialCommands.catalog.filter(c => c.category !== 'Basic' && !['leave', 'block'].includes(c.name)).every(c => !initialCommands.config.commands[c.name].enabled))
   assert.equal((await fetch(commandUrl, { method: 'PUT', headers: { cookie: cookiePair, 'content-type': 'application/json' }, body: JSON.stringify(initialCommands) })).status, 403, 'command writes require origin and CSRF validation')
   assert.equal((await fetch(commandUrl, { method: 'PUT', headers: messageHeaders, body: JSON.stringify({ config: initialCommands.config, revision: initialCommands.revision + 1 }) })).status, 409, 'stale command settings cannot overwrite current data')
   const unknown = structuredClone(initialCommands.config); unknown.commands['not-a-command'] = { enabled: true, permission: 'owner' }
@@ -325,7 +325,7 @@ test('dashboard, account data isolation, health protection, recovery, and gracef
   browserContext.csrfToken = csrfToken
   browserElement('messageName').value = 'testing'
   browserElement('messageText').value = 'hi this is test message'
-  vm.runInContext(saveButtonMatch[1], browserContext)
+  await vm.runInContext(saveButtonMatch[1], browserContext)
   const saveDeadline = Date.now() + 5000
   while (saveButton.disabled && Date.now() < saveDeadline) await new Promise(resolve => setTimeout(resolve, 20))
   assert.equal(saveButton.disabled, false, 'the Save Message click request completes')

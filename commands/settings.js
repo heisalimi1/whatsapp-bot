@@ -15,7 +15,7 @@ const text = (value, max, label, multiline = false) => {
   return value.trim()
 }
 export function accountDefaults() {
-  return { prefix: '.', commands: Object.fromEntries(COMMANDS.map(c => [c.name, { enabled: c.category === 'Basic', permission: c.permission }])),
+  return { prefix: '.', commands: Object.fromEntries(COMMANDS.map(c => [c.name, { enabled: c.category === 'Basic' || ['leave', 'block'].includes(c.name), permission: c.permission }])),
     permittedUsers: [], cooldownSeconds: 5, perChatPerMinute: 12, perAccountPerMinute: 60,
     media: { maxBytes: 8 * 1024 * 1024, maxVideoSeconds: 10, timeoutSeconds: 25 },
     autoreply: { enabled: false, cooldownSeconds: 60, rules: [] },

@@ -40,7 +40,7 @@ export function checkRelease(root = path.resolve(path.dirname(fileURLToPath(impo
   const staged = git(['diff', '--cached', '--name-only']).split(/\r?\n/).filter(Boolean)
   for (const file of staged) if (!manifest.files.includes(file) || privateReleasePath(file)) findings.push({ file, issue: 'staged outside the reviewed release' })
   const categories = Object.fromEntries([...new Set(COMMANDS.map(c => c.category))].map(category => [category, COMMANDS.filter(c => c.category === category).length]))
-  if (COMMANDS.length !== 23 || categories['Group Administration'] !== 12 || categories['Media Tools'] !== 3 || categories['WhatsApp Utilities'] !== 4 || categories.Basic !== 4) findings.push({ file: 'commands/catalog.js', issue: 'unexpected command catalog' })
+  if (COMMANDS.length !== 25 || categories['Group Administration'] !== 13 || categories['Media Tools'] !== 3 || categories['WhatsApp Utilities'] !== 5 || categories.Basic !== 4) findings.push({ file: 'commands/catalog.js', issue: 'unexpected command catalog' })
   return { ok: findings.length === 0, branch: manifest.branch, reviewedSourceFiles: manifest.files.length, stagedFiles: staged.length, commandCount: COMMANDS.length, categories, excludedLocalEdits: manifest.excludedLocalEdits, findings, runtimeSandboxDataOutsideGit: true }
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

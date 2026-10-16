@@ -232,6 +232,39 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     const { config, revision } = settingsFor(context); mutate(config)
     return store.saveSettings(context.account.workspaceId, context.account.id, config, revision)
   }
+  async function ownerNotice(context, text) {
+    // A block confirmation belongs in the owner's self chat, never in the
+    // blocked person's conversation. Failure here must not repeat the action.
+    const chat = userJid(context.socket.user?.id) || userJid(context.socket.user?.lid)
+    if (chat) { try { await reply({ ...context, chat }, text) } catch {} }
+  }
+  async function blockTarget(context, argument) {
+    const mentioned = context.info.mentionedJid
+    if (mentioned !== undefined && !Array.isArray(mentioned)) throw new CommandError('Select exactly one user to block.')
+    const quoted = !mentioned?.length && !argument && !!context.info.quotedMessage
+    if (quoted && context.info.remoteJid && context.info.remoteJid !== context.chat) throw new CommandError('Reply to a message in this chat to block its sender.')
+    const candidates = mentioned?.length ? mentioned : argument ? [argument] : quoted && context.info.participant ? [context.info.participant] : userJid(context.chat) ? [context.chat] : []
+    if (candidates.length !== 1) throw new CommandError('Use block with one mention, reply to a person, enter a number with country code, or use it in their private chat.')
+    const value = String(candidates[0] || '')
+    let jid = userJid(value) || (/^\+?\d{8,15}$/.test(value) ? value.replace(/^\+/, '') + '@s.whatsapp.net' : '')
+    if (!jid) throw new CommandError('Choose one valid user or a phone number with country code.')
+    const self = new Set([userJid(context.socket.user?.id), userJid(context.socket.user?.lid)].filter(Boolean))
+    for (const alias of await aliases(context.socket, context.socket.user?.id)) self.add(alias)
+    const identities = await aliases(context.socket, jid)
+    if ([...identities].some(identity => self.has(identity))) throw new CommandError('The connected WhatsApp account cannot block itself.')
+    if (jid.endsWith('@lid')) {
+      let phone = [...identities].find(identity => identity.endsWith('@s.whatsapp.net'))
+      if (!phone && groupJid(context.chat)) {
+        await metadata(context)
+        const member = participant(context, identities)
+        phone = userJid(member?.phoneNumber)
+      }
+      if (!phone?.endsWith('@s.whatsapp.net')) throw new CommandError('WhatsApp could not resolve this sender. Use block with their full number and country code.')
+      jid = phone
+    }
+    if (self.has(jid)) throw new CommandError('The connected WhatsApp account cannot block itself.')
+    return jid
+  }
   async function execute(context, name, argument) {
     const config = context.config, definition = COMMAND_BY_NAME.get(name)
     if (name === 'menu' || name === 'help') {
@@ -244,8 +277,25 @@ export function createCommandEngine({ store, getAccount, getSocket, media, servi
     }
     if (name === 'ping') return reply(context, 'Pong!')
     if (name === 'alive') return reply(context, 'WhatsApp is connected. Bot commands run on the server, even when the dashboard is closed.')
+    if (name === 'block') {
+      const jid = await blockTarget(context, argument)
+      await checkedSocket(context)
+      try { await timeout(context.socket.updateBlockStatus(jid, 'block')) }
+      catch { throw new CommandError('WhatsApp did not confirm the block. Check the account block list before trying a new command.', 'block-unconfirmed') }
+      await ownerNotice(context, 'User blocked for this WhatsApp account.')
+      return
+    }
     if (definition.category === 'Group Administration') {
       await metadata(context)
+      if (name === 'leave') {
+        if (argument) throw new CommandError(`Usage: ${config.prefix}leave in the group you want to leave.`)
+        await permissions(context)
+        await checkedSocket(context)
+        try { await timeout(context.socket.groupLeave(context.chat)) }
+        catch { throw new CommandError('WhatsApp did not confirm leaving this group. Check membership before trying a new command.', 'leave-unconfirmed') }
+        await ownerNotice(context, 'Left the WhatsApp group.')
+        return
+      }
       if (adminActions.has(name)) await requireAdmin(context, ['kick', 'promote', 'demote', 'mute', 'unmute'].includes(name))
       if (name === 'tagall' || name === 'tag') {
         const content = name === 'tag' ? tagContent(context, argument) : undefined
